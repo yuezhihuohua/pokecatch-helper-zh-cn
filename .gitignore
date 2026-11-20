@@ -1,4 +1,11 @@
-# personal game save used as the local test base (not published)
-pokecatch-*.json
-# local data dumps
+# Private/local data is never part of the public distribution.
+.DS_Store
+.env
+.env.*
+backups/
+private/
+work/
 node_modules/
+*.save.json
+*存档*.json
+*.log
