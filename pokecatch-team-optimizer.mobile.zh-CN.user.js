@@ -2,8 +2,8 @@
 // @name         Poke'Catch 配队助手（iPhone 简体中文版）
 // @name:zh-CN   Poke'Catch 配队助手（iPhone 简体中文版）
 // @namespace    pokecatch-helper-zh-CN-mobile
-// @version      1.9.0
-// @description  当前实力配队与培养方向分开评估；说明和换队弹窗随设备明暗切换；分段依据可见；团体战己方与同伴分开操作。保留 GrumpyOwl 原版功能与简体中文增强。
+// @version      1.11.0
+// @description  简体中文配队助手，支持冒险实战配队、分段模板、传说与团体战配队、游荡传说追捕。基于 GrumpyOwl 原版。
 // @author       GrumpyOwl (original); yuezhihuohua (Chinese improvements)
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -34,9 +34,8 @@
    * 0. Small helpers
    * ------------------------------------------------------------------ */
   const SAVE_KEY = 'gachamon-save-v1';
-  const VERSION = '1.9.0';
+  const VERSION = '1.11.0';
   const MOBILE_BUILD = true;
-  const UPSTREAM_VERSION = '1.6.4';
   const UPDATE_URL = 'https://raw.githubusercontent.com/yuezhihuohua/pokecatch-helper-zh-cn/main/pokecatch-team-optimizer.mobile.zh-CN.user.js';
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -220,18 +219,32 @@
     return new Function('__scope', 'with (__scope) { return (' + lit + '); }')(scope);
   }
 
-  /** Notice when the repo has a newer version: the install itself stays in Tampermonkey's hands. */
+  function isNewerVersion(candidate, installed) {
+    const candidateParts = candidate.split('.').map(Number);
+    const installedParts = installed.split('.').map(Number);
+    for (let i = 0; i < Math.max(candidateParts.length, installedParts.length); i++) {
+      const difference = (candidateParts[i] ?? 0) - (installedParts[i] ?? 0);
+      if (difference !== 0) return difference > 0;
+    }
+    return false;
+  }
+
+  /** Check this Chinese build's repository on load. Installation remains manual. */
   async function checkUpdate() {
-    const installed = UPSTREAM_VERSION;
     try {
       const code = await httpGet(UPDATE_URL + '?cb=' + Date.now());
-      const repo = (code.match(/@version\s+(\S+)/) || [])[1];
-      if (!repo || repo === installed) { log('debug', 'update: up to date', installed); return; }
-      log('info', 'update: a newer version is on GitHub', { installed, repo });
-      state.update = { installed, repo };
+      if (!code.startsWith('// ==UserScript==') || !code.includes('// ==/UserScript==')) return;
+      const header = code.split('// ==/UserScript==', 1)[0];
+      const repo = header.match(/^\/\/[ \t]+@version[ \t]+(\d+(?:\.\d+){1,3})[ \t]*\r?$/m)?.[1];
+      if (!repo) return;
+      state.update = isNewerVersion(repo, VERSION) ? { installed: VERSION, repo } : null;
+      if (state.update) log('info', 'update: newer Chinese build', state.update);
       refreshUi();
-    } catch (e) { log('debug', 'update: check failed', e.message); }
+    } catch (error) {
+      log('debug', 'update: check failed', error.message);
+    }
   }
+
 
   /** Every `name = <literal>` in the bundle (minified names are reused in several scopes). */
   function defLiterals(src, name, open) {
@@ -274,6 +287,62 @@
       } catch { /* not a script URL */ }
     }
     return null;
+  }
+
+  /** Read only the form definitions, without executing the game's initialization. */
+  function addBattleForms(source, species, moves, evolutions) {
+    const start = /a\.FORMS\s*=\s*function\(\)\{\s*const\s+[\w$]+\s*=\s*\[/.exec(source);
+    if (!start) return;
+    const forms = evalLit(literalAt(source, start.index + start[0].length - 1));
+    if (!Array.isArray(forms) || !forms.length || forms.some(form => !species[form.base] || !Number.isInteger(form.id))) {
+      throw new Error('invalid form definitions');
+    }
+    for (const form of forms) {
+      const base = species[form.base];
+      if (form.single) base.singleBattleSpecies = form.base;
+      const learn = (base.learn || []).map(([level, key]) => {
+        if (form.techno && key === 'techno-blast' && moves[key]) {
+          const variant = key + '-' + form.techno;
+          moves[variant] = { ...moves[key], type: form.techno };
+          return [level, variant];
+        }
+        return [level, key];
+      });
+      for (const key of [form.move, ...(form.moves || [])]) if (moves[key]) learn.push([50, key]);
+      const name = form.full ? form.form : form.form ? `${base.name} (${form.form})` : base.name;
+      species[form.id] = { ...base, id: form.id, name, formBase: form.base,
+        types: form.types || base.types, stats: form.stats || base.stats, learn };
+      if (form.evo) evolutions[form.id] = form.evo;
+    }
+    for (const form of forms) species[form.id].singleBattleSpecies = species[form.base].singleBattleSpecies;
+  }
+
+  const isLegendaryEntry = candidate => !!(candidate.species.legendary || candidate.species.mythical);
+  const nativeRegion = region => region === 'kanto2' ? 'johto' : (region || 'kanto');
+  const eventSpeciesKey = (candidate, elite = false) => candidate.species.singleBattleSpecies
+    ? 'family:' + candidate.species.singleBattleSpecies
+    : (elite ? 'species:' : candidate.proj.shiny ? 'shiny:' : 'normal:') + candidate.species.id;
+
+  function incompatibleEventPair(a, b, data) {
+    return (data.cfg.TEAM_APART || []).some(([id, others]) =>
+      (a.mon.id === id && others.includes(b.mon.id)) || (b.mon.id === id && others.includes(a.mon.id)));
+  }
+
+  function canAddEventMember(team, candidate, tier, data) {
+    if (tier && isLegendaryEntry(candidate) && team.filter(isLegendaryEntry).length >= (data.cfg.ELITE?.LEGENDS ?? 1)) return false;
+    const key = eventSpeciesKey(candidate, !!tier);
+    return team.every(member => member.mon.uid !== candidate.mon.uid
+      && eventSpeciesKey(member, !!tier) !== key && !incompatibleEventPair(member, candidate, data));
+  }
+
+  function eventCandidates(save, cap, zoneRegion) {
+    if (!save) return [];
+    // Zone teams in a regional link follow the zone's region. Raid teams have no zone filter.
+    const link = save.link;
+    const allow = mon => !zoneRegion || !link || (nativeRegion(zoneRegion) === nativeRegion(link.to))
+      === (nativeRegion(mon.reg) === nativeRegion(link.to));
+    // The link's stored adventure team is still present in the event picker's allMons().
+    return currentCandidates({ ...save, link: null }, true, cap, allow);
   }
 
   /** Extract the game's static tables from its own bundle. */
@@ -328,6 +397,9 @@
       if (Object.keys(value).length < 30 || !Object.values(value).every(v => Array.isArray(v) && kinds.has(v[0]) && Number.isFinite(v[1]))) throw new Error('invalid STATUS.MOVES');
       return value;
     }) || {};
+    const statusModule = src.slice(src.indexOf('a.STATUS='));
+    const caps = statusModule.slice(0, 12000).match(/\{status:(\d+),damaging:(\d+),signature:(\d+)\}/);
+    const statusCaps = caps ? { status: +caps[1], damaging: +caps[2], signature: +caps[3] } : null;
     // legend zones live in the same bundle: reading them here means one fetch, not two
     let legends = null;
     try { legends = parseLegends(src); } catch (e) { logError('bundle: legends', e); }
@@ -348,6 +420,8 @@
     const species = {};
     for (const s of dex) species[s.id] = { id: s.id, name: s.name, types: s.types, stats: s.stats, learn: s.learn, captureRate: s.captureRate, legendary: s.legendary, mythical: s.mythical, baby: s.baby, unique: s.unique };
 
+    try { addBattleForms(src, species, moves, evo); } catch (error) { logError('bundle: forms', error); }
+
     log('info', 'bundle: parsed', {
       url: url.split('/').pop(), dex: dex.length, moves: Object.keys(moves).length,
       chapters: chapters.length, regions: regions.length, ms: Date.now() - t0,
@@ -365,6 +439,7 @@
       leagueTeams,
       baseExp,
       statusMoves,
+      statusCaps,
       legends,
       cfg: {
         LEVEL_GAP: cfg.LEVEL_GAP, CRIT_MULT: cfg.CRIT_MULT, CRIT_CHANCE: cfg.CRIT_CHANCE,
@@ -399,6 +474,7 @@
         TEAM_SIZE: cfg.TEAM_SIZE, MAX_LEVEL: cfg.MAX_LEVEL, LEAGUE_CAP_MARGIN: cfg.LEAGUE_CAP_MARGIN,
         LEAGUE_DONE_CAP: cfg.LEAGUE_DONE_CAP, LEVEL_CAP_MARGIN: cfg.LEVEL_CAP_MARGIN,
         LEAGUE_BELOW: cfg.LEAGUE_TRAINERS?.below || [6, 5, 4, 3],
+        BOSS_STATUS: cfg.BOSS_STATUS || null, ROAMING: cfg.ROAMING || null, TEAM_APART: cfg.TEAM_APART || [],
         LEGEND_ZONE: cfg.LEGEND_ZONE, ELITE: cfg.ELITE, RANK_STAT: cfg.UNDERGROUND?.RANK_STAT ?? 1,
         CAPTURE_BONUS: cfg.CAPTURE_BONUS, CAPTURE_MAX: cfg.CAPTURE_MAX,
         LEGENDARY_CAPTURE_RATE: cfg.LEGENDARY_CAPTURE_RATE,
@@ -822,7 +898,7 @@
       return best;
     };
 
-    return { typeEff, statsOf, maxHp, bestMove, damage, movePower, moveAcc, moveDamage, bestDamage };
+    return { typeEff, statsOf, maxHp, bestMove, damage, movePower, moveAcc, moveDamage, bestDamage, learnset: mon => learnAll.learnAll[mon.id] || [] };
   }
 
   /* ------------------------------------------------------------------ *
@@ -1380,7 +1456,9 @@
   const statusCap = key => {
     const sure = key === 'spore' || key === 'sacred-fire' || key === 'nuzzle' || key === 'zap-cannon' || key === 'inferno' || key === 'dynamic-punch';
     const damaging = (state.data.moves[key]?.power || 0) > 0;
-    return sure ? 100 : damaging ? 30 : Math.min(state.data.moves[key]?.acc ?? 100, 70);
+    const caps = state.data.statusCaps;
+    return caps ? (sure ? caps.signature : damaging ? caps.damaging : caps.status)
+      : (sure ? 100 : damaging ? 30 : Math.min(state.data.moves[key]?.acc ?? 100, 70));
   };
   const statusOfMv = key => (state.data.statusMoves?.[key] || [])[0];
   const STATUS_IMMUNE = { burn: ['fire'], poison: ['poison', 'steel'], freeze: ['ice'], paralysis: [], sleep: [], confusion: [] };
@@ -1450,8 +1528,8 @@
       if (lv > att.level) continue;
       if ((state.data.moves[key]?.power || 0) > 0) continue;
       const status = statusOfMv(key);
-      if (!status || !state.data.moves[key] || !canStatus(def, status)) continue;
-      found = { key, status, chance: Math.min(state.data.moves[key].acc || 70, statusCap(key)) };
+      if (!status || !state.data.moves[key] || !canStatus(def, status) || effRaw(state.data.moves[key].type, def.types) === 0) continue;
+      found = { key, status, chance: Math.min(state.data.moves[key].acc || state.data.statusMoves?.[key]?.[1] || 70, statusCap(key)) };
     }
     return found;
   }
@@ -1554,7 +1632,7 @@
     if (def.hp > 0) {
       if (def.status === 'freeze' && mv.type === 'fire') simClear(def);
       const status = statusOfMv(mv.key);
-      if (status && simRandom() * 100 < (state.data.statusMoves?.[mv.key]?.[1] || 0) && canStatus(def, status)) simInflict(def, status);
+      if (status && simRandom() * 100 < Math.min(state.data.statusMoves?.[mv.key]?.[1] || 0, statusCap(mv.key)) && canStatus(def, status)) simInflict(def, status);
     }
     return dmg;
   }
@@ -1577,12 +1655,26 @@
     return sum;
   }
   /** The ordered chapter steps from the nodes the game built (heal stops + battles). */
+  function chapterRoamer(node, save) {
+    const id = Number(node?.roamer);
+    return node?.type === 'wild' && Number.isInteger(id) && id > 0 && !roamerCaught(save, id) ? id : undefined;
+  }
+
   function chapterPlan(data, save) {
     const plan = [];
     for (const [nodeIndex,node] of (save?.adv?.nodes || []).entries()) {
       if (node.type === 'berry') { plan.push({kind:'berry',nodeIndex,index:nodeIndex}); continue; }
       if (node.type === 'heal') { plan.push({kind:'heal', nodeIndex, index:nodeIndex}); continue; }
       const base = {kind:'battle', type:node.type, name:node.name, nodeIndex, index:nodeIndex};
+      const roamer = chapterRoamer(node, save);
+      if (roamer) {
+        if (!data.species[roamer]) throw new Error(`第 ${nodeIndex + 1} 步缺少游荡传说资料，无法模拟。`);
+        const cfg = data.cfg;
+        const highest = (save?.mons || []).reduce((level, mon) => Math.max(level, Number(mon.level) || 0), 0);
+        const level = Math.min(cfg.MAX_LEVEL, Math.max(cfg.ROAMING?.MIN_LEVEL ?? 100, highest));
+        plan.push({ ...base, name: displayName(roamer), roamer, fixed: [{ id: roamer, level }] });
+        continue;
+      }
       if (node.type === 'wild' || node.type === 'trainer') {
         if (node.team?.length) {
           const fixed = node.team.map(entry => Array.isArray(entry) ? {id:+entry[0],level:+entry[1]}
@@ -1672,6 +1764,12 @@
   /** The foes of one battle instance (wild roll, random trainer roll, or fixed team). */
   function rollBattleFoes(step, data, save, cap) {
     const cfg = data.cfg;
+    if (step.roamer) {
+      const { id, level } = step.fixed[0];
+      const power = cfg.LEGEND_ZONE?.ROAM_POWER ?? .6;
+      const hp = (cfg.LEGEND_ZONE?.ROAM_HP ?? 4) * (1 + (cfg.ENEMY_HP_PER_ALLY ?? .7) * (cfg.TEAM_SIZE - 1));
+      return { foes: [simFoe(id, level, hp, power)], slots: cfg.TEAM_SIZE, kind: 'wild', index: step.index, xp: true, roamer: true, power };
+    }
     if (step.fixed) {
       const count=step.fixed.length,region=state.data.chapters[save?.adv?.chapter]?.reg||'kanto';
       const slots=step.type==='static'?cfg.TEAM_SIZE:step.double&&count>=2?2:step.type==='trainer'&&count>=3&&cfg.TRIPLE?.REGIONS?.includes(region)&&simRandom()<cfg.TRIPLE.CHANCE?3:step.type==='trainer'&&count>=2&&simRandom()<cfg.DOUBLE_CHANCE?2:1;
@@ -1771,6 +1869,7 @@
 
   /** One battle (the game's ia/bs loop): slots, refills, stall, XP. */
   function simBattle(mons, spec) {
+    if (spec.roamer) return simRoamingBoss(mons, spec);
     const foes = spec.foes;
     const slots = Math.max(1, Math.min(spec.slots || 1, state.data.cfg.TEAM_SIZE));
     const foeSlots = Math.max(1, Math.min(slots, 3));
@@ -1908,88 +2007,157 @@
    * 6b. Legendary fights (roaming legendaries and their elite versions)
    * ------------------------------------------------------------------ */
   /** Build the boss (a legend zone) with the knobs the game uses for that fight. */
-  function legendBoss(zone, tier, team, eng, data) {
+  function legendBoss(zone, tier, team, eng, data, damageCache) {
     const cfg = data.cfg;
     const sp = data.species[zone.id];
     if (!sp) return null;
     const level = zone.level || 100;
     const mon = { id: zone.id, level, types: sp.types };
     const maxHp = eng.maxHp(mon);
-    // the boss scales with the team (shiny and level count as "power")
-    const aura = team.length
-      ? Math.pow(team.reduce((a, c) => a + (c.proj.shiny ? 1 : Math.max(1, Math.min(c.proj.level, cfg.MAX_LEVEL) / cfg.MAX_LEVEL)), 0) / team.length, cfg.LEGEND_ZONE?.AURA || 1)
+    const aura = team.length && !zone.roaming
+      ? Math.pow(team.reduce((sum, c) => sum + (c.proj.shiny ? 1 : Math.max(1,
+        Math.min(c.proj.level, cfg.MAX_LEVEL) / cfg.MAX_LEVEL * (cfg.RANK_STAT ?? 1) ** (c.proj.rank || 0))), 0) / team.length,
+        cfg.LEGEND_ZONE?.AURA ?? 1)
       : 1;
     // the game's eliteKnobs: a per-zone override wins over the shared ELITE_K table
     const inline = tier ? (zone.elite?.[zone.id]?.[tier] || zone.elite?.[tier]) : null;
     const eliteTable = tier ? (inline
       ? [inline.hp ?? 1, inline.power ?? 1]
-      : (state.legends?.elite?.[zone.id]?.[tier] || [1, 1])) : null;
+      : (data.legends?.elite?.[zone.id]?.[tier] || [1, 1])) : null;
     const eliteHp = tier ? (cfg.ELITE?.HP?.[tier] ?? 1) : 1;
     const elitePower = tier ? (cfg.ELITE?.POWER?.[tier] ?? 1) : 1;
     let hpKnob = (zone.hp ?? cfg.LEGEND_ZONE?.HP ?? 3) * eliteHp * (eliteTable ? eliteTable[0] : 1) * (tier ? 1 : aura);
     let powerKnob = (zone.power ?? cfg.LEGEND_ZONE?.POWER ?? .5) * elitePower * (eliteTable ? eliteTable[1] : 1) * (tier ? 1 : aura * aura);
-    if (tier && state.legends?.elitePower) {
-      const bounds = state.legends.elitePowerBounds;
-      const adjustment = clamp(state.legends.elitePower[zone.id] ?? 1, bounds[0], bounds[1]);
+    if (tier && data.legends?.elitePower) {
+      const bounds = data.legends.elitePowerBounds;
+      const adjustment = clamp(data.legends.elitePower[zone.id] ?? 1, bounds[0], bounds[1]);
       hpKnob = inline?.hp ?? (zone.hp ?? cfg.LEGEND_ZONE?.HP ?? 3) * eliteHp;
       powerKnob = inline?.power ?? (zone.power ?? cfg.LEGEND_ZONE?.POWER ?? .5) * elitePower * adjustment;
     }
     const hp = Math.floor(maxHp * (1 + (cfg.ENEMY_HP_PER_ALLY ?? .7) * (cfg.TEAM_SIZE - 1)) * hpKnob);
-    const resist = tier ? (cfg.ELITE?.RESIST?.[tier] ?? 1) : 1;
+    const statusRules = cfg.BOSS_STATUS && {
+      resist: tier ? (cfg.ELITE?.RESIST?.[tier] ?? 1) : 1,
+      tick: Math.max(1, Math.floor(hp / (cfg.ELITE?.HURT?.[tier] ?? cfg.BOSS_STATUS.HURT ?? 60))),
+      dotTurns: cfg.BOSS_STATUS.DOT_TURNS ?? 4, paraTurns: cfg.STATUS_FX?.PARA_TURNS ?? 3,
+      block: cfg.BOSS_STATUS.PARA_BLOCK ?? .2, setup: cfg.STATUS_MOVE_CHANCE ?? .3,
+    };
     const counter = zone.counter ? data.moves[zone.counter] : null;
     const burst = zone.burst ? data.moves[zone.burst] : null;
 
     const damageTo = target => {
+      if (damageCache?.has(target)) return damageCache.get(target) * powerKnob;
       const main = eng.bestDamage(mon, target);
-      const c = counter ? eng.moveDamage(mon, target, { type: counter.type, cat: counter.cat, power: eng.movePower(zone.counter), acc: counter.acc || 100 }) : 0;
-      const b = burst ? eng.moveDamage(mon, target, { type: burst.type, cat: burst.cat, power: eng.movePower(zone.burst), acc: burst.acc || 100 }) : 0;
       const lz = cfg.LEGEND_ZONE || {};
-      return (main / cfg.TEAM_SIZE + (lz.COUNTER ?? .3) * c + (cfg.TEAM_SIZE / (lz.RAGE ?? 8)) * (lz.BURST ?? 1) * b) * powerKnob;
+      const c = counter ? eng.moveDamage(mon, target, { type: counter.type, cat: counter.cat, power: eng.movePower(zone.counter), acc: counter.acc || 100 }) : main;
+      const b = burst ? eng.moveDamage(mon, target, { type: burst.type, cat: burst.cat, power: eng.movePower(zone.burst), acc: burst.acc || 100 }) : main;
+      const damage = (cfg.ENEMY_DAMAGE?.static ?? 1) * (main / cfg.TEAM_SIZE + (lz.COUNTER ?? .3) * c / cfg.TEAM_SIZE
+        + (lz.BURST ?? 1) * b / (lz.RAGE ?? 8));
+      damageCache?.set(target, damage);
+      return damage * powerKnob;
     };
 
-    return { zone, mon, types: sp.types, level, maxHp, hp, resist, powerKnob, damageTo, aura };
+    return { zone, mon, types: sp.types, level, maxHp, hp, powerKnob, damageTo, statusRules, data, aura };
+  }
+
+  function legendStatusChance(key, boss, pure = false) {
+    const effect = boss.data.statusMoves?.[key], rules = boss.statusRules;
+    if (!rules || !effect || !['burn', 'poison', 'paralysis'].includes(effect[0]) || !canStatus(boss.mon, effect[0])) return null;
+    const move = boss.data.moves[key];
+    if (!move || (pure && effRaw(move.type, boss.types) === 0)) return null;
+    const chance = pure ? (move.acc || effect[1]) : effect[1];
+    return { type: effect[0], chance: clamp(Math.min(chance, statusCap(key)) / 100 * rules.resist, 0, 1) };
+  }
+
+  // Static move and status information is shared across every candidate team and simulation.
+  function legendTurnStats(team, boss, eng, profiles) {
+    return team.map(c => {
+      let profile = profiles?.get(c.proj);
+      if (!profile) {
+        const move = eng.bestMove(c.proj, boss.types);
+        const damage = move ? eng.damage(c.proj, boss.mon, move, eng.typeEff(move.type, boss.types)) : 0;
+        let setup = null;
+        if (boss.statusRules) {
+          for (const [level, key] of eng.learnset?.(c.proj) || []) {
+            if (level > c.proj.level || (boss.data.moves[key]?.power || 0) > 0) continue;
+            const effect = legendStatusChance(key, boss, true);
+            if (effect?.chance) setup = effect;
+          }
+        }
+        profile = { move, damage, setup, secondary: legendStatusChance(move?.key, boss) };
+        profiles?.set(c.proj, profile);
+      }
+      return { ...profile, hp: c.hpCur ?? c.hp, incoming: boss.damageTo(c.proj) };
+    });
+  }
+
+  function expectedLegendRound(team, rules) {
+    let direct = 0, noDot = 1, noPara = 1, forgone = 0;
+    for (const member of team) {
+      const damage = member.damage * (member.move?.acc ?? 0) / 100;
+      direct += damage;
+      if (!rules) continue;
+      const setup = member.setup ? (member.move ? rules.setup : 1) : 0;
+      const pure = setup * (member.setup?.chance ?? 0);
+      const secondary = (1 - setup) * (member.move?.acc ?? 0) / 100 * (member.secondary?.chance ?? 0);
+      noDot *= 1 - (member.setup?.type === 'paralysis' ? 0 : pure) - (member.secondary?.type === 'paralysis' ? 0 : secondary);
+      noPara *= 1 - (member.setup?.type === 'paralysis' ? pure : 0) - (member.secondary?.type === 'paralysis' ? secondary : 0);
+      forgone += setup * damage;
+    }
+    if (!rules) return { outgoing: direct, counter: 1 };
+    const dot = (1 - noDot) * rules.dotTurns;
+    const para = noDot * (1 - noPara) * rules.paraTurns;
+    const total = 1 + dot + para;
+    return { outgoing: direct - forgone / total + rules.tick * dot / total,
+      counter: 1 - rules.block * para / total };
   }
 
   /** One legendary fight with the game's rolls (used for the win chance). */
-  function legendFightOnce(team, boss, eng) {
-    const alive = team.map(c => ({ c, hp: c.hpCur != null ? c.hpCur : c.hp }));
+  function legendFightOnce(team, boss, eng, stats = legendTurnStats(team, boss, eng), random = Math.random) {
+    const members = stats.map(member => ({ ...member }));
+    const alive = members.filter(member => member.hp > 0);
+    const rules = boss.statusRules;
     let bossHp = boss.hp, rounds = 0;
+    let status = null, duration = 0;
+    const inflict = effect => {
+      if (!effect?.chance || status || random() >= effect.chance) return;
+      status = effect.type;
+      duration = status === 'paralysis' ? rules.paraTurns : rules.dotTurns;
+    };
     while (bossHp > 0 && alive.length && rounds < 400) {
-      let dps = 0;
-      for (const a of alive) {
-        const mv = eng.bestMove(a.c.proj, boss.types);
-        if (!mv) continue;
-        if (Math.random() * 100 > mv.acc) continue;                    // miss
-        const eff = eng.typeEff(mv.type, boss.types);
-        let d = eng.damage(a.c.proj, boss.mon, mv, eff) / 0.925;        // undo the average roll
-        d *= 0.85 + Math.random() * 0.15;                               // damage roll
-        if (Math.random() < 1 / 24) d *= 1.5;                           // crit
-        dps += d;
+      for (const member of alive) {
+        if (!status && member.setup && (!member.move || random() < rules.setup)) {
+          inflict(member.setup);
+          continue;
+        }
+        if (!member.move || random() * 100 >= member.move.acc) continue;
+        let damage = member.damage / .925 * (.85 + random() * .15);
+        if (random() < (boss.data.cfg.CRIT_CHANCE ?? 1 / 24)) damage *= boss.data.cfg.CRIT_MULT ?? 1.5;
+        bossHp -= damage;
+        if (bossHp <= 0) break;
+        inflict(member.secondary);
       }
-      dps *= boss.resist;
-      bossHp -= dps;
       rounds++;
-      for (const a of alive) {
-        const hit = boss.damageTo(a.c.proj) / 0.925;
-        a.hp -= hit * (0.85 + Math.random() * 0.15);
+      if (bossHp > 0 && (status === 'poison' || status === 'burn')) bossHp -= rules.tick;
+      if (bossHp <= 0) break;
+      if (status !== 'paralysis' || random() >= rules.block) {
+        for (const member of alive) member.hp -= member.incoming / .925 * (.85 + random() * .15);
       }
       for (let i = alive.length - 1; i >= 0; i--) if (alive[i].hp <= 0) alive.splice(i, 1);
+      if (status && --duration <= 0) status = null;
     }
-    return { win: bossHp <= 0, rounds };
+    return { win: bossHp <= 0, rounds, remaining: members.map(member => Math.max(0, member.hp)) };
   }
 
-  /** Seconds of one fight: the game runs a round in ~2.5 s at its fast speed (measured). */
-  const SEC_PER_ROUND = 2.5;
-  const CAPTURE_SEC = 2.5;
-
-  /** Victory chance, run time and the expected attempts / total time to catch the boss. */
-  function legendOdds(zone, tier, team, eng, data, save, runs = 200) {
+  /** Victory estimate and the conditional capture chance of a normal zone. */
+  function* legendOddsSteps(zone, tier, team, eng, data, save, runs = 200) {
     const boss = legendBoss(zone, tier, team, eng, data);
     if (!boss || !team.length) return null;
+    const stats = legendTurnStats(team, boss, eng);
     let wins = 0, roundsSum = 0;
     for (let i = 0; i < runs; i++) {
-      const r = legendFightOnce(team, boss, eng);
+      const r = legendFightOnce(team, boss, eng, stats);
       if (r.win) { wins++; roundsSum += r.rounds; }
+      yield;
     }
     const winChance = wins / runs;
     const rounds = wins ? roundsSum / wins : 0;
@@ -2002,46 +2170,33 @@
     const rate = sp
       ? ((sp.legendary || sp.mythical) ? (cfg.LEGENDARY_CAPTURE_RATE ?? 3) : (sp.captureRate ?? 45) * (cfg.CAPTURE_BONUS ?? .6)) / 255
       : 0;
-    const pCatch = Math.min((cfg.CAPTURE_MAX ?? .6) * buff, rate * buff);
+    const pCatch = tier ? null : Math.min((cfg.CAPTURE_MAX ?? .6) * buff, rate * buff);
+    return { wins, runs, winChance, rounds: Math.round(rounds * 10) / 10, pCatch };
+  }
 
-    const speed = save?.adv?.speed ?? 1;
-    const secPerRound = SEC_PER_ROUND * (4 / Math.max(1, speed));
-    const runMs = (rounds * secPerRound + CAPTURE_SEC) * 1000;
-    const q = winChance * pCatch;
-    const pity = cfg.RAID_PITY ?? 150;
-    // expected attempts, capped by the raid pity
-    let expected = 0;
-    if (q > 0) {
-      for (let i = 0; i < pity; i++) expected += Math.pow(1 - q, i);
-    } else expected = pity;
-    const fails = q > 0 ? Math.pow(1 - q, pity) : 1;
-    return {
-      winChance, rounds: Math.round(rounds), pCatch, attempts: expected,
-      runMs, totalMs: expected * runMs, guaranteed: fails, speed
-    };
+  function legendOdds(zone, tier, team, eng, data, save, runs = 200) {
+    return finishLegendSteps(legendOddsSteps(zone, tier, team, eng, data, save, runs));
   }
 
   /** One legendary fight: the boss hits the whole team every round. */
-  function simulateLegend(team, boss, eng) {
-    const alive = team.map(c => ({ c, hp: c.hpCur != null ? c.hpCur : c.hp }));
+  function simulateLegend(team, boss, eng, profiles) {
+    const stats = legendTurnStats(team, boss, eng, profiles);
+    const alive = stats.filter(member => member.hp > 0).map(member => ({ ...member }));
+    let expected = expectedLegendRound(alive, boss.statusRules);
+    const initialCounter = expected.counter;
     let bossHp = boss.hp, rounds = 0, dealt = 0;
     while (bossHp > 0 && alive.length && rounds < 400) {
-      let dps = 0;
-      for (const a of alive) {
-        const mv = eng.bestMove(a.c.proj, boss.types);
-        if (!mv) continue;
-        const eff = eng.typeEff(mv.type, boss.types);
-        dps += eng.damage(a.c.proj, boss.mon, mv, eff) * (mv.acc / 100);
-      }
-      dps *= boss.resist;
-      bossHp -= dps;
-      dealt += dps;
+      bossHp -= expected.outgoing;
+      dealt += expected.outgoing;
       rounds++;
-      for (const a of alive) a.hp -= boss.damageTo(a.c.proj);
+      if (bossHp <= 0) break;
+      for (const member of alive) member.hp -= member.incoming * expected.counter;
+      const before = alive.length;
       for (let i = alive.length - 1; i >= 0; i--) if (alive[i].hp <= 0) alive.splice(i, 1);
+      if (alive.length !== before) expected = expectedLegendRound(alive, boss.statusRules);
     }
-    const teamHp = team.reduce((a, c) => a + (c.hpCur != null ? c.hpCur : c.hp), 0);
-    const perRound = team.length ? team.reduce((a, c) => a + boss.damageTo(c.proj), 0) / team.length : 0;
+    const teamHp = stats.reduce((sum, member) => sum + member.hp, 0);
+    const perRound = stats.length ? stats.reduce((sum, member) => sum + member.incoming, 0) / stats.length * initialCounter : 0;
     return {
       win: bossHp <= 0,
       roundsKill: bossHp <= 0 ? rounds : Infinity,
@@ -2051,50 +2206,111 @@
     };
   }
 
-  function evaluateLegendTeam(team, zone, tier, eng, data) {
-    const boss = legendBoss(zone, tier, team, eng, data);
+  function evaluateLegendTeam(team, zone, tier, eng, data, preset = state.preset, damageCache, profiles) {
+    const boss = legendBoss(zone, tier, team, eng, data, damageCache);
     if (!boss) return 0;
-    const res = simulateLegend(team, boss, eng);
-    if (state.preset === 'offense') return res.dealt / Math.max(1, boss.hp);
-    return fightScore(res, state.preset);
+    const res = simulateLegend(team, boss, eng, profiles);
+    const damageFraction = Math.min(1, res.dealt / Math.max(1, boss.hp));
+    const survival = res.roundsDie / (res.roundsDie + 30);
+    if (!res.win) return damageFraction + (preset === 'defense' ? .6 : .15) * survival;
+    if (preset === 'offense') return 2 + 1 / res.roundsKill;
+    if (preset === 'defense') return 2 + survival;
+    return 2 + res.roundsDie / (res.roundsDie + res.roundsKill);
   }
 
   /** Greedy team builder for one legendary boss. */
-  function pickLegendTeam(cands, zone, tier, eng, data, size = 6) {
+  function* searchLegendSteps(cands, zone, tier, eng, data, preset, size = 6) {
     // rank the candidates by what they actually bring against that boss
-    const boss = legendBoss(zone, tier, cands.slice(0, 6), eng, data);
+    const damageCache = new Map(), profiles = new Map();
+    const boss = legendBoss(zone, tier, cands.slice(0, 6), eng, data, damageCache);
+    if (!boss) return [];
     const contribution = c => {
-      if (!boss) return c.proj.level;
-      const mv = eng.bestMove(c.proj, boss.types);
-      if (!mv) return 0;
-      const eff = eng.typeEff(mv.type, boss.types);
-      const dps = eng.damage(c.proj, boss.mon, mv, eff) * (mv.acc / 100);
-      const inc = boss.damageTo(c.proj);
-      const alive = inc > 0 ? c.hp / inc : 999;
-      return dps * Math.min(alive, 400);
+      const stats = legendTurnStats([c], boss, eng, profiles);
+      const expected = expectedLegendRound(stats, boss.statusRules);
+      const incoming = stats[0].incoming * expected.counter;
+      return expected.outgoing * Math.min(400, c.hp / Math.max(incoming, 1));
     };
-    const pool = cands.slice().sort((a, b) => contribution(b) - contribution(a)).slice(0, 80);
-    const chosen = [];
-    const usedSpecies = new Set();
-    const usedShiny = new Set();
-    const usedUids = new Set();
+    const ranked = [];
+    for (const cand of cands) {
+      ranked.push({ cand, score: contribution(cand) });
+      yield;
+    }
+    ranked.sort((a, b) => b.score - a.score);
+    const seen = new Set();
+    const unique = ranked.map(entry => entry.cand).filter(c => {
+      const key = eventSpeciesKey(c, !!tier);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    const pool = tier
+      ? [...unique.filter(isLegendaryEntry).slice(0, 12), ...unique.filter(c => !isLegendaryEntry(c)).slice(0, 68)]
+      : unique.slice(0, 80);
+    let chosen = [];
+    const score = team => evaluateLegendTeam(team, zone, tier, eng, data, preset, damageCache, profiles);
     while (chosen.length < size) {
       let best = null, bestScore = -Infinity;
       for (const cand of pool) {
-        if (chosen.includes(cand) || usedUids.has(cand.mon.uid)) continue;
-        if (!cand.proj.shiny && usedSpecies.has(cand.species.id)) continue;
-        if (cand.proj.shiny && usedShiny.has(cand.species.id)) continue;
-        const sc = evaluateLegendTeam(chosen.concat([cand]), zone, tier, eng, data);
+        if (!canAddEventMember(chosen, cand, tier, data)) continue;
+        const sc = score([...chosen, cand]);
         if (sc > bestScore) { bestScore = sc; best = cand; }
+        yield;
       }
       if (!best) break;
       chosen.push(best);
-      usedSpecies.add(best.species.id);
-      usedUids.add(best.mon.uid);
-      if (best.proj.shiny) usedShiny.add(best.species.id);
+    }
+    let bestScore = score(chosen);
+    const alternatives = [...unique.slice(0, 24), ...pool.filter(c => tier && !isLegendaryEntry(c)).slice(0, 12)];
+    for (let slot = 0; slot < chosen.length; slot++) {
+      const others = chosen.filter((_, i) => i !== slot);
+      for (const cand of new Set(alternatives)) {
+        if (cand === chosen[slot] || !canAddEventMember(others, cand, tier, data)) continue;
+        const trial = chosen.slice();
+        trial[slot] = cand;
+        const sc = score(trial);
+        if (sc > bestScore) { chosen = trial; bestScore = sc; }
+        yield;
+      }
     }
     return chosen;
   }
+
+  // Cache the boss hit and learnset projections during repeat chapter trials.
+  let roamingCacheEngine = null;
+  const roamingFightProfiles = new Map();
+  function simRoamingBoss(mons, spec) {
+    const { data, engine } = state, foe = spec.foes[0];
+    if (roamingCacheEngine !== engine || roamingFightProfiles.size >= 2048) {
+      roamingCacheEngine = engine;
+      roamingFightProfiles.clear();
+    }
+    const boss = legendBoss({ id: foe.id, level: foe.level, roaming: true,
+      hp: data.cfg.LEGEND_ZONE?.ROAM_HP ?? 4, power: spec.power }, 0, [], engine, data);
+    const living = mons.filter(mon => mon.hp > 0);
+    const stats = living.map(mon => {
+      const key = JSON.stringify([foe.id, foe.level, mon.id, mon.level, mon.shiny, mon.rank, mon.statMult, mon.status]);
+      if (!roamingFightProfiles.has(key)) {
+        const proj = { ...mon, types: data.species[mon.id].types };
+        roamingFightProfiles.set(key, legendTurnStats([{proj, hp: 0}], boss, engine)[0]);
+      }
+      return { ...roamingFightProfiles.get(key), hp: mon.hp };
+    });
+    const result = legendFightOnce([], boss, engine, stats, simRandom);
+    living.forEach((mon, i) => { mon.hp = Math.floor(result.remaining[i]); });
+    if (result.win && spec.xp) awardXp(foe, living, mons, 'wild', false);
+    return { won: result.win, at: spec.index };
+  }
+
+  function pickLegendTeam(cands, zone, tier, eng, data, size = 6) {
+    return finishLegendSteps(searchLegendSteps(cands, zone, tier, eng, data, state.preset, size));
+  }
+
+  function finishLegendSteps(steps) {
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+  }
+
 
   /* ------------------------------------------------------------------ *
    * 7. Wipe watcher: remembers on which step the team falls
@@ -2580,15 +2796,21 @@
         rank:Math.max(0, rank), statMult:key.startsWith('bot') ? state.data.cfg.RAID.BOT_STATS ?? 1 : 1});
     });
     if (!mons.length || mons.some(mon => !mon)) return null;
-    const dps = mons.reduce((sum, mon) => sum + raidDps(mon, boss), 0);
+    const profiles = mons.map(mon => raidCombatProfile(mon, boss));
+    const dps = profiles.reduce((sum, profile) => sum + profile.dps, 0);
     if (!Number.isFinite(dps)) return null;
-    return {key, name:row.querySelector('.nm b,.nm')?.textContent.trim() || key, mons, dps};
+    return {key, name:row.querySelector('.nm b,.nm')?.textContent.trim() || key, mons, dps, profiles};
   }
 
-  function chooseRaidAllyPair(candidates, current, count) {
+  function chooseRaidAllyPair(candidates, current, count, boss) {
     const unique = new Map();
     for (const candidate of candidates) if (candidate?.key && Number.isFinite(candidate.dps)) unique.set(candidate.key, candidate);
-    const best = [...unique.values()].sort((a, b) => b.dps - a.dps || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)).slice(0, count);
+    const raw = [...unique.values()].sort((a, b) => b.dps - a.dps);
+    const referenceDps = raw.slice(0, count).reduce((sum, candidate) => sum + candidate.dps, 0);
+    const horizon = boss ? Math.min(400, Math.max(1, Math.ceil(boss.maxHp / Math.max(1, referenceDps)))) : 1;
+    const value = candidate => boss && candidate.profiles ? raidContribution(candidate.profiles, horizon) : candidate.dps * horizon;
+    const best = raw.sort((a, b) => value(b) - value(a) || b.dps - a.dps
+      || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)).slice(0, count);
     if (best.length < count) throw new Error(`可读取的同伴不足 ${count} 位，请检查候选列表后重试。`);
     // Retain winners already in a slot: the game excludes an ally selected in the other slot.
     const chosen = new Set(best.map(candidate => candidate.key));
@@ -2689,7 +2911,7 @@
         await closeRaidChooser(ownedModal); ownedModal = null;
       }
       if (JSON.stringify(original) !== JSON.stringify(readRaidPickKeys(ctx.region))) throw new Error('选择期间同伴发生变化，请重新点击。');
-      const plan = chooseRaidAllyPair([...candidates.values()], original, count);
+      const plan = chooseRaidAllyPair([...candidates.values()], original, count, boss);
       for (let slot = 0; slot < count; slot++) {
         assertRaidContext(ctx);
         const key = plan.assigned[slot];
@@ -2698,7 +2920,7 @@
         const row = [...ownedModal.querySelectorAll('.raid-pick[data-pick]')].find(el => el.dataset.pick === key);
         const current = row && readRaidAllyCandidate(row, ctx, boss);
         const expected = plan.best.find(candidate => candidate.key === key);
-        if (!current || Math.abs(current.dps - expected.dps) > 1e-6) throw new Error('同伴候选名单已刷新，请重新点击。');
+        if (!current || current.profiles.length !== expected.profiles.length || current.profiles.some((profile, i) => profile.dps !== expected.profiles[i].dps || profile.rounds !== expected.profiles[i].rounds)) throw new Error('同伴候选名单已刷新，请重新点击。');
         row.click();
         await waitRaidUi(() => readRaidPickKeys(ctx.region)[slot] === key, '同伴未保存成功，请重试。');
         await waitRaidUi(() => !ownedModal.isConnected || !ownedModal.classList.contains('open'), '选择后弹窗未关闭，请重试。');
@@ -2744,7 +2966,7 @@
       const result = state.raidAllyResults?.[raidAllyResultKey(ctx)];
       const current = readRaidPickKeys(ctx.region);
       const saved = typeof result === 'string' ? result : result?.keys?.every((key, i) => current[i] === key) ? result.text : result ? '同伴名单或选择已变化，请重新点击选择。' : '';
-      const message = blocked ? '开战后不可换同伴，退出战斗后再选。' : saved || '按当前首领的预计伤害，比较同伴的整组宝可梦后选择两位。';
+      const message = blocked ? '开战后不可换同伴，退出战斗后再选。' : saved || '按当前首领的预计伤害和生存时间，比较每位同伴的整组宝可梦。';
       const html = `<button class="btn small" data-act="allies" ${blocked || state.busy ? 'disabled' : ''}>${state.raidAllyBusy === ctx.region ? '正在选择…' : '一键最佳同伴'}</button><p class="pcopt-mut" role="status" aria-live="polite">${esc(message)}</p>`;
       const box = mountBlock(host, 'raid-allies', JSON.stringify([ctx.id, blocked, state.busy, state.raidAllyBusy, message]), html, el => {
         el.querySelector('[data-act="allies"]').onclick = () => runRaidAllyAction(ctx);
@@ -2753,16 +2975,76 @@
     }
   }
 
-  /** Existing picker action: choose my pair, close it, then choose this card's allies. */
-  async function fastestClear(rc){
-    const boss=raidBoss(rc),save=readSave(),count=state.data.cfg.RAID?.MINE??2;
-    const mine=(save?.mons||[]).filter(mon=>state.data.species[mon.id]).map(mon=>({mon,dps:raidDps(raidAllyMon(mon),boss)})).sort((a,b)=>b.dps-a.dps||b.mon.level-a.mon.level);
-    const seen=new Set(),team=mine.filter(c=>!seen.has(c.mon.id)&&seen.add(c.mon.id)).slice(0,count);
-    if(team.length<count)throw new Error('没有足够的可用宝可梦。');
-    const done=await applyToEventPicker(team);if(done!==count)throw new Error('己方队伍未完整放入，请检查锁定或队伍限制后重试。');
-    state.evtOdds={key:'raid:'+rc.id,text:'己方已核对 · 预计伤害 '+Math.round(team.reduce((sum,c)=>sum+c.dps,0))+'/回合。同伴请回团体战主页面选择。'};
-    return{team};
+  let raidProfileEngine = null;
+  const raidProfiles = new Map();
+
+  function raidCombatProfile(mon, boss) {
+    const engine = state.engine, cfg = state.data.cfg;
+    if (raidProfileEngine !== engine || raidProfiles.size >= 2048) {
+      raidProfileEngine = engine;
+      raidProfiles.clear();
+    }
+    const key = JSON.stringify([boss.mon.id, boss.dmgMult, mon.id, mon.level, !!mon.shiny, mon.rank, mon.statMult, mon.hpMult]);
+    if (!raidProfiles.has(key)) {
+      const target = { ...mon, types: state.data.species[mon.id].types };
+      const hp = engine.maxHp(target);
+      const incoming = engine.bestDamage(boss.mon, target) / Math.max(1, cfg.TEAM_SIZE)
+        * boss.dmgMult * (cfg.ENEMY_DAMAGE?.static ?? 1);
+      const rounds = incoming > 0 ? Math.max(1, Math.ceil(hp / incoming)) : Infinity;
+      raidProfiles.set(key, { dps: raidDps(target, boss), rounds });
+    }
+    return raidProfiles.get(key);
   }
+
+  const raidContribution = (profiles, rounds) => profiles.reduce((sum, profile) =>
+    sum + profile.dps * Math.min(rounds, profile.rounds), 0);
+
+  function chooseRaidOwnTeam(entries, count, boss, data) {
+    const byDps = entries.slice().sort((a, b) => b.profile.dps - a.profile.dps);
+    const reference = [];
+    for (const entry of byDps) {
+      if (canAddEventMember(reference, entry, 0, data)) reference.push(entry);
+      if (reference.length === count) break;
+    }
+    const rawDps = reference.reduce((sum, entry) => sum + entry.profile.dps, 0);
+    const horizon = Math.min(400, Math.max(1, Math.ceil(boss.maxHp / Math.max(1, rawDps))));
+    const ranked = entries.slice().sort((a, b) =>
+      raidContribution([b.profile], horizon) - raidContribution([a.profile], horizon) || b.profile.dps - a.profile.dps);
+    const team = [];
+    for (const entry of ranked) {
+      if (canAddEventMember(team, entry, 0, data)) team.push(entry);
+      if (team.length === count) break;
+    }
+    return team;
+  }
+
+  /** Apply the recommended own members to this event picker only. */
+  async function fastestClear(rc) {
+    const { data } = state, boss = raidBoss(rc), save = readSave(), count = data.cfg.RAID?.MINE ?? 2;
+    const level = data.cfg.RAID?.LEVEL ?? data.cfg.MAX_LEVEL;
+    const head = document.querySelector('#evt-pick-head');
+    const active = () => eventPickerOpen(head) && raidContext()?.id === rc.id;
+    const mine = eventCandidates(save, level);
+    const entries = [];
+    let until = performance.now() + 12;
+    for (const candidate of mine) {
+      entries.push({ ...candidate, profile: raidCombatProfile(candidate.proj, boss) });
+      if (performance.now() < until) continue;
+      await sleep(0);
+      if (!active()) throw new Error('选队窗口已变化，请重新打开后再试。');
+      until = performance.now() + 12;
+    }
+    const team = chooseRaidOwnTeam(entries, count, boss, data);
+    if (team.length < count) throw new Error(`当前只有 ${team.length} 只符合限制的可用宝可梦，未应用队伍。`);
+    if (!active()) throw new Error('选队窗口已变化，请重新打开后再试。');
+    const done = await applyToEventPicker(team);
+    if (done !== count) throw new Error(`已核对 ${done}/${count} 个己方位置，请检查窗口和成员限制后重试。`);
+    const members = team.map(({ mon, profile }) =>
+      `${displayName(mon.id)} ${Math.round(profile.dps)} 伤害/回合、约 ${Number.isFinite(profile.rounds) ? profile.rounds : '—'} 回合倒下`);
+    state.evtOdds = { key: 'raid:' + rc.id, text: '己方已核对 · ' + members.join('；') };
+    return { team };
+  }
+
 
   /* ------------------------------------------------------------------ *
    * 8c. Inside the game: my controls next to its own "Optimize" button
@@ -2786,69 +3068,87 @@
     return null;
   }
 
-  /** What the game's team picker is open for (the boss and the elite tier, from its header). */
+  function eventPickerOpen(head) {
+    if (!head?.isConnected) return false;
+    const picker = head.closest('#evt-pick');
+    return !picker || picker.classList.contains('open');
+  }
+
+  /** Read the actual boss and the zone used for region and elite settings. */
   function pickerContext() {
-    const headEl = document.querySelector('#evt-pick-head');
-    const head = headEl?.querySelector('h2');
-    if (!head || !state.legends || !state.data) return null;
-    const txt = head.textContent.replace(/\s+/g, ' ').trim();
-    const id = headerBossId(headEl);
+    const head = document.querySelector('#evt-pick-head');
+    if (!eventPickerOpen(head) || !state.legends || !state.data) return null;
+    const text = head.querySelector('h2')?.textContent || '';
+    const match = text.match(/(?:[eé]lite|精英)[\s：:]*([1-5]|IV|III|II|V|I)(?=\s|$|对|[:：])/i);
+    const tier = match ? ({ I: 1, II: 2, III: 3, IV: 4, V: 5 }[match[1].toUpperCase()] || Number(match[1])) : 0;
+    const id = headerBossId(head);
     if (!id) return null;
-    const zone = state.legends.zones.find(z => z.id === id);
+    const formBase = state.data.species[id]?.formBase;
+    const zone = state.legends.zones.find(z => z.id === id) || state.legends.zones.find(z => z.id === formBase);
     if (!zone) return null;
-    const tier = +(((txt.match(/(?:lite|精英)\s*(\d)/i) || [])[1]) || 0);
-    return { zone, tier };
+    return { zone: id === zone.id ? zone : { ...zone, id, zoneId: zone.id }, tier };
   }
 
-  function oddsText(o) {
-    if (!o) return '';
-    if (o.winChance < 0.02) return `胜率约 0% · 当前队伍暂时无法取胜`;
-    return `胜率 ${Math.max(1, Math.round(o.winChance * 100))}% · ${o.rounds} 回合 ≈ ${fmtTime(o.runMs)}/次`
-      + ` · 单次捕获率 ${(o.pCatch * 100).toFixed(1)}%`
-      + ` · 预计 ${o.attempts < 10 ? o.attempts.toFixed(1) : Math.round(o.attempts)} 次 ≈ ${fmtTime(o.totalMs)}`
-      + (o.attempts > (state.data?.cfg?.RAID_PITY ?? 150) * 0.9 ? '（含保底）' : '');
+  function oddsText(estimate) {
+    if (!estimate) return '';
+    const { wins, runs, rounds, pCatch } = estimate;
+    if (!wins) return `${runs} 次模拟未取胜`;
+    const rate = Math.round(estimate.winChance * 1000) / 10;
+    return `模拟胜率 ${rate}%（${wins}/${runs}） · 取胜平均 ${rounds} 回合`
+      + (pCatch == null ? '' : ` · 取胜后单次捕获率 ${(pCatch * 100).toFixed(1)}%`);
   }
 
-  /** Drag a PC cell of the game's picker into one of its team slots. */
+
+  /** Apply exact individual IDs through the game's own pointer handlers. */
   async function applyToEventPicker(team) {
-    const input = document.querySelector('#evt-search');
-    const count = Math.min(team.length, $$('#evt-team .slot').length);
-    let done = 0;
+    const head = document.querySelector('#evt-pick-head'), input = document.querySelector('#evt-search');
+    if (!eventPickerOpen(head)) return 0;
+    const title = head.querySelector('h2')?.textContent, boss = headerBossId(head);
+    const initialSearch = input?.value || '';
+    const active = () => eventPickerOpen(head) && head === document.querySelector('#evt-pick-head')
+      && head.querySelector('h2')?.textContent === title && headerBossId(head) === boss;
+    const slots = () => $$('#evt-team .slot');
+    const pcCell = uid => $$('#evt-pc .pc-cell[data-uid]').find(cell => cell.dataset.uid === uid);
+    const count = Math.min(team.length, slots().length);
+    let changedSearch = false;
     try {
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < count && active(); i++) {
         const uid = team[i].mon.uid;
-        const placed = () => $$('#evt-team .slot')[i]?.dataset.uid === uid;
-        if (placed()) { done++; continue; }
-        for (let attempt = 0; attempt < 2 && !placed(); attempt++) {
-          const slots = $$('#evt-team .slot'), slot = slots[i];
-          if (!slot) break;
-          let cell = slots.find(s => s.dataset.uid === uid)
-            || document.querySelector(`#evt-pc .pc-cell[data-uid="${uid}"]`);
+        const placed = () => active() && slots()[i]?.dataset.uid === uid;
+        for (let attempt = 0; attempt < 2 && active() && !placed(); attempt++) {
+          let cell = slots().find(slot => slot.dataset.uid === uid) || pcCell(uid);
           if (!cell && input) {
             const mon = monByUid(readSave(), uid);
-            input.value = mon ? gameSearchName(mon.id, true) : '';
-            input.dispatchEvent(new Event('input', {bubbles:true}));
+            if (!mon) break;
+            input.value = gameSearchName(mon.id, true);
+            changedSearch = true;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
             await sleep(450);
-            cell = document.querySelector(`#evt-pc .pc-cell[data-uid="${uid}"]`);
+            if (!active()) break;
+            cell = pcCell(uid);
           }
-          if (!cell) break;
+          const slot = slots()[i];
+          if (!cell || !slot) break;
           await dragToSlot(cell, slot);
-          if (await waitPlaced(placed)) break;
+          for (let check = 0; check < 10 && active() && !placed(); check++) await sleep(100);
         }
         if (!placed()) break;
-        done++;
       }
     } finally {
-      if (input?.value) { input.value = ''; input.dispatchEvent(new Event('input', {bubbles:true})); }
+      if (changedSearch && active() && input.isConnected) {
+        input.value = initialSearch;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
     }
-    return team.slice(0, count).filter((entry, i) => $$('#evt-team .slot')[i]?.dataset.uid === entry.mon.uid).length;
+    return active() ? team.slice(0, count).filter((entry, i) => slots()[i]?.dataset.uid === entry.mon.uid).length : 0;
   }
+
 
   /** Add my controls beside the game's own "Optimize" button, inside its team picker.
    *  Raids get the fastest-clear button + DPS badges; legend zones get the odds + team. */
   async function injectPickerUi() {
     const head = document.querySelector('#evt-pick-head');
-    if (!head) return;
+    if (!eventPickerOpen(head)) return;
     if (!state.engine) { try { await ensureData(); } catch { return; } }
     if (!head.isConnected) return;
     const rc = raidContext();
@@ -2877,9 +3177,9 @@
     monitorOpen: store.get('monitorExpanded', false) === true,
     events: null, enemies: null, scored: null, team: null,
     preset: 'balanced', errors: [], busy: false, watcher: null, eligible: 0,
-    apiCache: {}, info: {}, legends: null, legBoss: null, legTier: 0, legTeam: null, waiting: null,
+    apiCache: {}, info: {}, legends: null, waiting: null,
     evtOdds: null, loading: null,
-    league: false, leagueInfo: null, legOdds: null,
+    league: false, leagueInfo: null,
     segments: null, segOn: null, reuseAll: false, switching: false, selfClick: false, manual: null
   };
 
@@ -3031,60 +3331,7 @@
     }).join('');
   }
 
-  const legendZones = () => (state.legends?.zones || []);
 
-
-  function legendZone() {
-    const zones = legendZones().filter(z => z.region === state.legRegion);
-    if (!zones.length) return null;
-    const cur = zones.find(z => String(z.id) === String(state.legBoss)) || zones[0];
-    state.legBoss = String(cur.id);
-    return cur;
-  }
-
-
-
-  function legendInfo() {
-    const zone = legendZone();
-    if (!zone || !state.engine) return '';
-    const save = readSave();
-    const cands = save ? currentCandidates(save, true, state.legTier ? state.data.cfg.MAX_LEVEL : (zone.level ?? 100)) : [];
-    const boss = legendBoss(zone, state.legTier, cands, state.engine, state.data);
-    if (!boss) return '';
-    const dmg = cands.length ? Math.round(cands.reduce((a, c) => a + boss.damageTo(c.proj), 0) / cands.length) : 0;
-    const mv = state.engine.bestMove(boss.mon, cands[0]?.proj.types || boss.types);
-    return `${esc(displayName(zone.id))} · ${boss.types.map(zhType).join('/')} · ${Math.round(boss.hp).toLocaleString('zh-CN')} 生命值 · 约 ${dmg} 伤害/回合`
-      + (zone.burst ? ` · ${esc(displayMove(zone.burst))}` : '')
-      + (state.legTier ? ` · 精英 ${state.legTier}` : '');
-  }
-
-  const fmtTime = ms => {
-    if (!isFinite(ms) || ms <= 0) return '—';
-    const s = Math.round(ms / 1000);
-    if (s < 90) return s + '秒';
-    const m = s / 60;
-    if (m < 90) return (Math.round(m * 10) / 10) + '分钟';
-    return (Math.round(m / 60 * 10) / 10) + '小时';
-  };
-
-  /** Victory chance, run time and the odds to catch the boss. */
-  function legendOddsLine() {
-    return oddsText(state.legOdds);
-  }
-
-  function renderLegendTeam() {
-    const cap = state.events?.cap ?? state.data?.cfg?.MAX_LEVEL ?? 100;
-    if (!state.legTeam) return '<div class="pcopt-mut">点击“助手配队”生成传说对战队伍</div>';
-    if (!state.legTeam.length) return '<div class="pcopt-mut">没有符合条件的宝可梦</div>';
-    return state.legTeam.map((s, i) => {
-      const sp = s.species;
-      const lv = s.proj.level < s.mon.level ? `实际等级 ${s.mon.level} · 本场按 ${s.proj.level} 级` : `等级 ${s.mon.level}`;
-      const endForm = endFormAtCap(s.mon, cap);
-      return `<div class="pcopt-mon"><div>${i + 1}. <b>${esc(displayName(sp.id))}</b> <span class="pcopt-mut">${lv}${s.proj.shiny ? ' ✨' : ''}</span>`
-        + `<div class="pcopt-row">${sp.types.map(typeBadge).join('')}</div>`
-        + `<div class="pcopt-mut">${s.hp} 生命值${s.proj.shiny ? ' · 能力值 +10%' : ''}</div></div></div>`;
-    }).join('');
-  }
 
   /** The Defense / Offense / Balanced switch (same preset for both optimizers). */
   const presetSeg = () => `<div class="seg" data-presets>
@@ -3232,7 +3479,7 @@
     const node=save.adv.node||0;const entry=plan.list.find(e=>e.healNode!=null&&e.healNode>=node);return entry||null;
   }
   async function switchSegment(){
-    const plan=state.segments;if(!plan?.auto||state.busy||state.switching||document.hidden)return;
+    const plan=state.segments;if(!plan?.auto||state.busy||state.switching||document.hidden||roamerHunt)return;
     const save=readSave(),stop=reason=>{plan.auto=false;plan.pending=null;state.segmentNotice=reason;store.set('segments',plan);refreshUi()};
     const issue=segmentIssue(save,plan);if(issue){stop(issue+' 自动安排已停止。');return}
     if(plan.pending&&(save.adv.node||0)>plan.pending.heal){
@@ -3317,6 +3564,8 @@
       .pcopt-dialog .pcopt-help-head svg{width:22px;height:22px;display:block}
       @media(prefers-reduced-motion:reduce){.pcopt-dialog .pcopt-help-sheet{animation:none}.pcopt-place-track>[data-place-bar]{transition:none}}
 
+      .pcopt-roamer{margin:8px 0 4px}.pcopt-roamer select{min-height:44px;max-width:100%;font-size:16px;color:var(--text);background:var(--panel)}
+      .pcopt-roamer button{min-height:44px}.pcopt-roamer [data-roamer-time],.pcopt-roamer [data-roamer-wait]{font-variant-numeric:tabular-nums}
       .pcopt-chapter-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px;cursor:pointer;list-style:none;padding:4px 0;touch-action:manipulation}
       .pcopt-chapter-summary::-webkit-details-marker{display:none}
       .pcopt-chapter-heading{display:flex;flex-direction:column;min-width:0;gap:2px}
@@ -3423,7 +3672,308 @@
 
   const errLine = () => state.errors.length ? `<div class="pcopt-err">${state.errors.map(e => esc(zhError(e))).join('<br>')}</div>` : '';
   const updateLine = () => state.update
-    ? `<div class="pcopt-err">原版已更新至 ${esc(state.update.repo)}（此中文版基于 ${esc(state.update.installed)}）。请先核对汉化兼容性，再手动更新。</div>` : '';
+    ? `<div class="pcopt-mut">中文版已更新至 ${esc(state.update.repo)}，当前安装的是 ${esc(state.update.installed)}。<a href="https://github.com/yuezhihuohua/pokecatch-helper-zh-cn/releases" target="_blank" rel="noopener noreferrer">查看发布页</a></div>` : '';
+
+  /* Roamer hunt adapted from GrumpyOwl's 1.6.7, commit 0e6720cf1177df3d14f0bada9fe62a1644479837. */
+  const ROAMER_POLL_MS = 700;
+  const ROAMER_CAPTURE_GRACE_MS = 4000;
+  const ROAMER_HOUR_MS = 60 * 60 * 1000;
+  const ROAMER_RESTART_LIMIT = 120;
+  const ROAMER_REST_MS = 10 * 60 * 1000;
+  let roamerHunt = null;
+  let roamerSelection = null;
+  let roamerNotice = '';
+  const roamerPacing = { restarts: [], next: 0, restUntil: 0 };
+
+  const roamerCaught = (save, id) => Array.isArray(save?.roam?.caught) && save.roam.caught.some(value => Number(value) === id);
+  const roamerSpecial = adv => adv?.event || adv?.zone || adv?.league || adv?.tower || adv?.raid;
+
+  function roamerPlacement(save, id) {
+    const at = save?.roam?.at?.[id];
+    if (at?.ch == null || at.until == null) return null;
+    const ch = Number(at.ch), until = Number(at.until);
+    return Number.isInteger(ch) && ch >= 0 && Number.isFinite(until) ? { id, ch, until } : null;
+  }
+
+  function roamerOptions(save, now = Date.now()) {
+    return Object.keys(save?.roam?.at || {}).map(Number)
+      .filter(id => Number.isInteger(id) && id > 0 && !roamerCaught(save, id))
+      .map(id => roamerPlacement(save, id))
+      .filter(entry => entry && entry.until > now)
+      .sort((a, b) => a.until - b.until || a.id - b.id);
+  }
+
+  // Pick a delay once per click and retain the budget across stop/start in this page.
+  function roamerRestartTime(pacing, now) {
+    pacing.restarts = pacing.restarts.filter(time => now - time < ROAMER_HOUR_MS);
+    if (pacing.restarts.length >= ROAMER_RESTART_LIMIT && !pacing.restUntil) {
+      pacing.restUntil = Math.max(now + ROAMER_REST_MS, pacing.restarts[0] + ROAMER_HOUR_MS);
+    }
+    if (pacing.restUntil <= now) pacing.restUntil = 0;
+    return Math.max(pacing.next, pacing.restUntil);
+  }
+
+  function recordRoamerRestart(pacing, now, random = Math.random()) {
+    pacing.restarts.push(now);
+    pacing.next = now + 8000 + random * 8000;
+  }
+
+  function nextRoamerAction(save, job, now) {
+    const adv = save?.adv;
+    if (!adv) return 'save';
+    if (roamerCaught(save, job.id)) return 'caught';
+    if (roamerSpecial(adv)) return 'special';
+    if (Number(adv.battle?.roam) === job.id) return 'fight';
+    if (job.resolveAt && now < job.resolveAt) return 'capture';
+    const at = roamerPlacement(save, job.id);
+    if (!at) return 'gone';
+    if (at.until <= now) return 'expired';
+    if (adv.paused) return 'paused';
+    if (adv.battle || adv.pending) return 'waiting';
+    if (job.resolveAt || adv.chapter !== at.ch) return 'restart';
+    if (!Array.isArray(adv.nodes) || !adv.nodes.length) return 'route';
+    // The game assigns node.roamer when it builds a chapter. Let marked routes play out.
+    return adv.nodes.some((node, i) => i >= adv.node && Number(node?.roamer) === job.id) ? 'route' : 'restart';
+  }
+
+  const roamerMap = () => document.querySelector('#screen-map.active');
+  const roamerAdventure = () => document.querySelector('#screen-adventure.active');
+  const canDriveRoamer = job => roamerHunt === job && !document.hidden && !state.busy
+    && !!(roamerMap() || roamerAdventure());
+
+  function stopRoamerHunt(message = '已停止追捕。正在进行的战斗会由游戏继续处理。') {
+    if (!roamerHunt) return;
+    clearInterval(roamerHunt.timer);
+    roamerHunt = null;
+    roamerNotice = message;
+    refreshUi();
+  }
+
+  function roamerStatus(job, message) {
+    if (roamerHunt !== job || job.status === message) return;
+    job.status = message;
+    refreshUi();
+  }
+
+  /** Drive the game's chapter controls. The job and placement are checked again before restarting. */
+  async function restartRoamerChapter(job, ch) {
+    const stillTarget = () => {
+      if (!canDriveRoamer(job)) return false;
+      const save = readSave(), at = roamerPlacement(save, job.id);
+      return at?.ch === ch && nextRoamerAction(save, job, Date.now()) === 'restart';
+    };
+    if (!stillTarget()) return;
+    if (!roamerMap()) {
+      const navigate = document.querySelector('#side [data-screen="map"]:not(.locked)')
+        || document.querySelector('#chapter-btn, #tabs [data-screen="map"]:not(.locked)');
+      if (!navigate) throw new Error('找不到游戏的进度入口。');
+      navigate.click();
+      for (let i = 0; i < 10 && stillTarget() && !roamerMap(); i++) await sleep(200);
+      if (!stillTarget()) return;
+    }
+    const map = roamerMap();
+    if (!map) throw new Error('游戏未打开进度页。');
+    const rowAt = () => map.querySelector(`.mp-row[data-ch="${ch}"]`);
+    let row = rowAt();
+    const region = state.data?.chapters?.[ch]?.reg || 'kanto';
+    if (!row) {
+      const regionButton = map.querySelector(`.rg.open[data-rg="${region}"]`);
+      if (regionButton && stillTarget()) {
+        regionButton.click();
+        for (let i = 0; i < 8 && stillTarget() && !rowAt(); i++) await sleep(200);
+        row = rowAt();
+      }
+    }
+    if (!stillTarget() || roamerMap() !== map) return;
+    if (!row) throw new Error('进度页找不到目标章节，请确认已解锁。');
+    row.click();
+    const buttonAt = () => {
+      const sameChapter = readSave()?.adv?.chapter === ch;
+      return map.querySelector(`.mp-restart[data-restart="${ch}"]:not([disabled])`)
+        || (!sameChapter && map.querySelector(`.mp-go[data-go="${ch}"]:not([disabled])`));
+    };
+    for (let i = 0; i < 10 && stillTarget() && !buttonAt(); i++) await sleep(180);
+    if (!stillTarget() || roamerMap() !== map) return;
+    const button = buttonAt();
+    if (!button) throw new Error('游戏未提供目标章节的重开或前往按钮。');
+    const before = readSave(), now = Date.now();
+    if (roamerRestartTime(roamerPacing, now) > now) return;
+    recordRoamerRestart(roamerPacing, now);
+    job.restarts++;
+    button.click();
+    for (let i = 0; i < 18; i++) {
+      if (roamerHunt !== job) return;
+      const after = readSave();
+      if (after !== before && after?.adv?.chapter === ch
+        && (before.adv.chapter !== ch || after.adv.node === 0 || after.adv.node < before.adv.node || roamerAdventure())) {
+        job.resolveAt = 0;
+        roamerStatus(job, '已进入目标章节，等待游荡遭遇。');
+        return;
+      }
+      await sleep(200);
+    }
+    throw new Error('游戏未确认重开，请核对当前路线。');
+  }
+
+  async function pollRoamerHunt(job) {
+    if (roamerHunt !== job || job.working || document.hidden) return;
+    const save = readSave(), now = Date.now();
+    if (job.inFight && Number(save?.adv?.battle?.roam) !== job.id) {
+      job.inFight = false;
+      job.resolveAt = now + ROAMER_CAPTURE_GRACE_MS;
+    }
+    const action = nextRoamerAction(save, job, now);
+    const stops = {
+      caught: `已捕获${displayName(job.id)}，追捕结束。`,
+      expired: '目标出没时间已结束，追捕已停止。',
+      gone: '游戏已不显示该目标，追捕已停止。',
+      special: '已进入特殊挑战，追捕已停止。',
+      save: '暂时无法读取冒险进度，追捕已停止。',
+    };
+    if (stops[action]) { stopRoamerHunt(stops[action]); return; }
+    if (action === 'fight' && !job.inFight) {
+      job.inFight = true;
+      job.resolveAt = 0;
+      job.encounters++;
+    }
+    const at = roamerPlacement(save, job.id);
+    if (at && at.ch !== job.ch) {
+      job.ch = at.ch;
+      roamerStatus(job, '目标换章，追捕将跟随。');
+    }
+    const messages = {
+      fight: '正在与目标战斗，等待游戏结算。',
+      capture: '等待游戏写入捕获结果…',
+      paused: '冒险已暂停。恢复冒险后继续追捕。',
+      waiting: '等待当前战斗或游戏事件结束…',
+      route: '等待路线上的游荡遭遇…',
+    };
+    if (messages[action]) { roamerStatus(job, messages[action]); return; }
+    if (!canDriveRoamer(job)) {
+      roamerStatus(job, state.busy ? '等待配队助手完成操作…' : '回到冒险或进度页后继续追捕。');
+      return;
+    }
+    const next = roamerRestartTime(roamerPacing, now);
+    if (next > now) {
+      roamerStatus(job, roamerPacing.restUntil > now ? '已达到重开频率上限，休息中。' : '正在等待下次重开…');
+      return;
+    }
+    job.working = true;
+    roamerStatus(job, '正在打开目标章节…');
+    try {
+      await restartRoamerChapter(job, at.ch);
+    } catch (error) {
+      if (roamerHunt === job) stopRoamerHunt('追捕已停止：' + error.message);
+    } finally {
+      job.working = false;
+    }
+  }
+
+  function startRoamerHunt(selection) {
+    if (roamerHunt) return;
+    const save = readSave(), at = roamerPlacement(save, Number(selection));
+    if (!save?.adv || !state.data || state.busy || roamerSpecial(save.adv) || !at
+      || at.until <= Date.now() || roamerCaught(save, at.id)) {
+      roamerNotice = '暂时无法开始。请核对目标时间和当前冒险状态，再重试。';
+      refreshUi();
+      return;
+    }
+    const plan = state.segments;
+    if (plan?.auto) {
+      plan.auto = false;
+      plan.pending = null;
+      state.segmentNotice = '已开始追捕游荡传说，分段自动安排已关闭。';
+      store.set('segments', plan);
+    }
+    const job = { id: at.id, ch: at.ch, inFight: false, resolveAt: 0, restarts: 0, encounters: 0,
+      working: false, status: '准备追捕…', timer: null };
+    roamerSelection = at.id;
+    roamerNotice = '';
+    roamerHunt = job;
+    job.timer = setInterval(() => pollRoamerHunt(job).catch(error => {
+      if (roamerHunt === job) stopRoamerHunt('追捕已停止：' + error.message);
+    }), ROAMER_POLL_MS);
+    refreshUi();
+  }
+
+  function roamerChapterLabel(ch) {
+    const chapter = state.data?.chapters?.[ch], region = chapter?.reg || 'kanto';
+    if (!chapter) return '章节 ' + ch;
+    const chapters = chaptersOf(state.data, region);
+    const title = zhText(chapter.name || '');
+    return `${REGION_NAMES[region] || region}第 ${chapters.indexOf(ch) + 1} 章${title ? ' · ' + title : ''}`;
+  }
+
+  function roamerTimeLeft(until, now) {
+    const seconds = Math.max(0, Math.ceil((until - now) / 1000));
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  function paintRoamerCountdown(box, until, next, now) {
+    const time = box?.querySelector('[data-roamer-time]');
+    const text = until ? `剩余 ${roamerTimeLeft(until, now)}` : '';
+    if (time && time.textContent !== text) time.textContent = text;
+    const wait = box?.querySelector('[data-roamer-wait]');
+    const pause = next > now ? `下次重开还需 ${roamerTimeLeft(next, now)}` : '';
+    if (wait && wait.textContent !== pause) wait.textContent = pause;
+  }
+
+  function mountRoamerHunt(host, compact = false) {
+    if (!host) return;
+    const job = roamerHunt;
+    if (compact && !job) {
+      if (!roamerNotice) { host.querySelector('[data-pcopt="roamer-active"]')?.remove(); return; }
+      const notice = `<div class="pcopt-row"><span role="status">${esc(roamerNotice)}</span>
+        <button type="button" class="btn small ghost" data-roamer-dismiss>关闭提示</button></div>`;
+      mountBlock(host, 'roamer-active', notice, notice, el => {
+        el.classList.add('pcopt-roamer');
+        el.querySelector('[data-roamer-dismiss]').onclick = () => { roamerNotice = ''; refreshUi(); };
+      }, { before: '#arena' });
+      return;
+    }
+    const save = readSave(), now = Date.now();
+    const options = job ? [] : roamerOptions(save, now);
+    const selected = job ? roamerPlacement(save, job.id) : options.find(entry => entry.id === roamerSelection) || options[0];
+    const count = Number(save?.items?.['master-ball']) || 0;
+    const available = !!selected && !!save?.adv && !!state.data && !state.busy && !roamerSpecial(save.adv);
+    const name = selected ? displayName(selected.id) : job ? displayName(job.id) : '';
+    const chapter = selected || job ? roamerChapterLabel(selected?.ch ?? job.ch) : '';
+    const next = job?.status.includes('休息') || job?.status.includes('下次重开')
+      ? Math.max(roamerPacing.next, roamerPacing.restUntil) : 0;
+    const target = name ? `<span>${esc(name)} · ${esc(chapter)}</span> <span class="pcopt-mut" data-roamer-time></span>` : '';
+    const html = job ? `
+      <div class="pcopt-row"><b>游荡传说追捕</b> ${target}
+        <button type="button" class="btn small ghost" data-roamer-stop>停止追捕</button></div>
+      <div class="pcopt-mut" role="status">${esc(job.status)} 已重开 ${job.restarts} 次，遭遇 ${job.encounters} 次。</div>
+      <div class="pcopt-mut" data-roamer-wait></div>` : `
+      <div class="pcopt-row"><b>游荡传说追捕</b></div>
+      <div class="pcopt-row">
+        <select aria-label="选择游荡传说" data-roamer-select ${options.length ? '' : 'disabled'}>
+          ${options.length ? options.map(entry => `<option value="${entry.id}" ${entry.id === selected?.id ? 'selected' : ''}>${esc(displayName(entry.id))}</option>`).join('')
+            : '<option>暂无可追捕目标</option>'}
+        </select>
+        <button type="button" class="btn small" data-roamer-start ${available ? '' : 'disabled'}>开始追捕</button>
+      </div>
+      ${target ? `<div>${target}</div><div class="pcopt-mut">开始后会按需重开章节。背包大师球 ${count} 个；捕获判定时，游戏可自动使用大师球。</div>` : ''}
+      ${selected && save?.adv?.paused ? '<div class="pcopt-mut">冒险暂停中，需在游戏内恢复才能推进。</div>' : ''}
+      ${selected && roamerSpecial(save?.adv) ? '<div class="pcopt-mut">请先结束当前特殊挑战。</div>' : ''}
+      ${selected && state.segments?.auto ? '<div class="pcopt-mut">开始后将关闭分段自动安排，已保存的方案保留。</div>' : ''}
+      ${roamerNotice ? `<div class="pcopt-mut" role="status">${esc(roamerNotice)}</div>` : ''}`;
+    const box = mountBlock(host, compact ? 'roamer-active' : 'roamer-hunt', html, html, el => {
+      el.classList.add('pcopt-roamer');
+      const select = el.querySelector('[data-roamer-select]');
+      if (select) select.onchange = () => {
+        roamerSelection = Number(select.value);
+        refreshUi();
+        host.querySelector('[data-roamer-select]')?.focus();
+      };
+      const start = el.querySelector('[data-roamer-start]');
+      if (start) start.onclick = () => startRoamerHunt(selected?.id);
+      const stop = el.querySelector('[data-roamer-stop]');
+      if (stop) stop.onclick = () => stopRoamerHunt();
+    }, compact ? { before: '#arena' } : {});
+    paintRoamerCountdown(box, selected?.until, next, now);
+  }
 
   /** The Progress screen: what the game is doing right now, the wipes, the data status. */
   function mountMonitor() {
@@ -3476,6 +4026,7 @@
       el.querySelector('[data-act="clear"]').onclick = () => { state.watcher?.clear(); refreshUi(); };
       el.querySelector('[data-act="retry"]').onclick = () => ensureData({ force: true });
     });
+    mountRoamerHunt(el?.querySelector('.pcopt-monitor-content'));
     // A region switch may append the game's new content after an existing block.
     if (el && body.lastElementChild !== el) body.appendChild(el);
   }
@@ -3538,7 +4089,7 @@
     const recent=(state.watcher?.fails||[]).find(f=>f.chapter===save?.adv?.chapter&&(!f.why||f.why==='chapter')&&['gym','trainer','wild','static'].includes(f.kind));
     const wipeText=res=>!res?'无可用对照':Object.entries(res.wipeAt||{}).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([i,n])=>'第 '+(+i+1)+' 步 '+zhText(save?.adv?.nodes?.[i]?.name||'战斗')+'（'+n+'/'+res.runs+' 次）').join('；')||'本次复核未团灭';
     const history=recent?`<div class="pcopt-explain"><b>最近实战团灭：第 ${recent.node+1} 步 · ${esc(zhText(recent.name))}</b><br><small>${esc(new Date(recent.at).toLocaleString('zh-CN'))} · ${esc((recent.enemies||[]).map(m=>displayName(m.id)+' Lv.'+m.level).join('、')||'未采集到完整对手')}</small><br><span class="pcopt-mut">${sim?.focus?'本次优先优化通过这场战斗的比例。':sim?'这条记录不在本次路线或无法匹配，本次按路线通关表现比较。':'可匹配当前章节的团灭位置会自动用于下一次计算。'}</span></div>`:'<div class="pcopt-mut">当前章节暂无可匹配的实战团灭记录：先模拟整章，显示预计容易失败的位置；监测到团灭后，下次计算优先针对该位置。</div>';
-    const report=sim?`<div class="pcopt-explain">${sim.focus?`<b>突破上次团灭战斗：推荐 ${pct(sim.focusRate)}${baseline?' · 原安排 '+pct(baseline.focusRate):''}</b><br>`:''}<div class="pcopt-help-line"><b>分析范围全程通过：推荐 ${pct(sim.rate)}${baseline?' · 原安排 '+pct(baseline.rate):''}</b>${helpButton('results','模拟结果怎么看')}</div><br>${sim.scope==='restart'?'整章重试，回复后满血开局':'下一个宝可梦中心回复后开始'} · 第 ${sim.range[0]+1}–${sim.range[1]+1} 步<p>${esc(sim.reason)}</p><p>原安排最常团灭：${esc(wipeText(baseline))}<br>推荐最常团灭：${esc(wipeText(sim))}</p>${sim.changes?.added?.length?'<p>建议换入：'+esc(sim.changes.added.join('、'))+'<br>换下：'+esc(sim.changes.removed.join('、'))+'</p>':''}<details><summary>查看模拟依据</summary><p>独立复核 ${sim.runs} 次 · 全程通过率样本估计区间 ${pct(sim.interval[0])}–${pct(sim.interval[1])}<br>平均通过 ${sim.avgCleared.toFixed(1)}/${sim.totalBattles} 场 · 比较 ${sim.evaluated} 组队伍 · 候选 ${sim.poolSize}/${sim.totalCandidates}<br>以计算时的实际等级、形态和阶级为基础；正常获得经验、掉血与战斗推进不会锁住安排按钮。升级后可重新计算。</p></details><small>实战记录与模拟结果分开显示；模型估计不保证通关。</small></div>`:'';
+    const report=sim?`<div class="pcopt-explain">${sim.focus?`<b>突破上次团灭战斗：推荐 ${pct(sim.focusRate)}${baseline?' · 原安排 '+pct(baseline.focusRate):''}</b><br>`:''}<div class="pcopt-help-line"><b>分析范围全程通过：推荐 ${pct(sim.rate)}${baseline?' · 原安排 '+pct(baseline.rate):''}</b>${helpButton('results','模拟结果怎么看')}</div><br>${sim.scope==='restart'?'整章重试，回复后满血开局':'下一个宝可梦中心回复后开始'} · 第 ${sim.range[0]+1}–${sim.range[1]+1} 步<p>${esc(sim.reason)}</p>${sim.roamers?.length ? `<p class="pcopt-mut">已计入当前路线标记的游荡遭遇：${esc(sim.roamers.map(displayName).join("、"))}。重开章节后，遭遇位置可能变化。</p>` : ""}<p>原安排最常团灭：${esc(wipeText(baseline))}<br>推荐最常团灭：${esc(wipeText(sim))}</p>${sim.changes?.added?.length?'<p>建议换入：'+esc(sim.changes.added.join('、'))+'<br>换下：'+esc(sim.changes.removed.join('、'))+'</p>':''}<details><summary>查看模拟依据</summary><p>独立复核 ${sim.runs} 次 · 全程通过率样本估计区间 ${pct(sim.interval[0])}–${pct(sim.interval[1])}<br>平均通过 ${sim.avgCleared.toFixed(1)}/${sim.totalBattles} 场 · 比较 ${sim.evaluated} 组队伍 · 候选 ${sim.poolSize}/${sim.totalCandidates}<br>以计算时的实际等级、形态和阶级为基础；正常获得经验、掉血与战斗推进不会锁住安排按钮。升级后可重新计算。</p></details><small>实战记录与模拟结果分开显示；模型估计不保证通关。</small></div>`:'';
     const upcoming=nextSegmentTarget(save);
     const segmentIssueText=state.segments?segmentIssue(save):'',readyTemplates=state.segments&&!segmentIssueText&&state.segments.list.every(e=>templateMatches(save,e));
     const segment=state.segments?.version===3?`<div class="pcopt-plan-list"><b>${esc(segmentStatus(save))}</b><br><small>分析于 ${esc(new Date(state.segments.createdAt).toLocaleString('zh-CN'))} · 后续段按当时等级满血估计</small>${state.segments.list.map((entry,i)=>`<div class="pcopt-segment-card"><b>第 ${i+1} 段 · 第 ${entry.startNode+1}–${entry.endNode+1} 步</b><div>${esc(entry.label)}</div><div class="pcopt-segment-status">${esc(entry.names.map((name,j)=>name+' Lv.'+entry.levels[j]).join('、'))}<br>模型通过 ${pct(entry.res.rate)}${entry.res.rate<.5?' · 暂未找到稳定通关方案':''}${entry.slot!=null?' · 游戏模板 '+(entry.slot+1)+(templateMatches(save,entry)?' 已核对':' 已变化'): ' · 方案已保存，未写入游戏模板'}${entry.reason?'<br>'+esc(entry.reason)+'<br>现队全程 '+pct(entry.baseline?.rate??0)+' · 比较 '+entry.evaluated+' 组':''}${i>0&&state.segments.list.slice(0,i).some(e=>sameTeam(e.team,entry.team))?'<br>与前面的分段共用队伍，无需重复换人。':''}</div><button class="btn small ghost" data-arrange-segment="${i}" ${state.busy||segmentIssueText?'disabled':''}>安排本段</button></div>`).join('')}<button class="btn small ghost" data-act="save-segments" ${state.busy||segmentIssueText?'disabled':''}>保存游戏模板</button><label style="display:block;margin-top:12px"><input type="checkbox" data-auto-segments ${state.segments.auto?'checked':''} ${state.busy||!readyTemplates?'disabled':''}> 自动提前安排下一段</label><div class="pcopt-segment-status">${upcoming?'下一回复点后使用第 '+(state.segments.list.indexOf(upcoming)+1)+' 段；当前出战队伍不变。':'本章后面没有尚未处理的回复点。'}</div>${!readyTemplates&&!segmentIssueText?'<p class="pcopt-mut">先保存并核对全部游戏模板，再开启自动。</p>':''}${state.segmentNotice?'<p class="pcopt-note" role="status">'+esc(state.segmentNotice)+'</p>':''}</div>`:'';
@@ -3565,48 +4116,174 @@
       el.querySelectorAll('[data-planning-help]').forEach(button=>button.onclick=event=>{event.preventDefault();event.stopPropagation();openPlanningHelp(button.dataset.planningHelp)});
       el.querySelectorAll('[data-arrange-segment]').forEach(button=>button.onclick=()=>arrangeSegment(+button.dataset.arrangeSegment));
       const saveSegments=el.querySelector('[data-act="save-segments"]');if(saveSegments)saveSegments.onclick=saveSegmentTemplates;
-      const auto=el.querySelector('[data-auto-segments]');if(auto)auto.onchange=()=>{if(auto.checked&&!nextSegmentTarget(readSave())){auto.checked=false;state.segmentNotice='本章后面没有可安排的回复点。可手动安排，为下一次挑战准备。';state.segments.auto=false;store.set('segments',state.segments);refreshUi();return}state.segments.auto=auto.checked;state.segments.manualUntil=null;state.segments.pending=null;store.set('segments',state.segments);state.segmentNotice=auto.checked?'已开启：会在路上提前安排下一回复点后的队伍，并在回复后核对。':'自动已关闭，保留当前安排。';refreshUi();if(auto.checked)switchSegment()};
+      const auto=el.querySelector('[data-auto-segments]');if(auto)auto.onchange=()=>{if(auto.checked&&roamerHunt){auto.checked=false;state.segmentNotice='追捕进行中，请先停止追捕再开启分段自动安排。';refreshUi();return}if(auto.checked&&!nextSegmentTarget(readSave())){auto.checked=false;state.segmentNotice='本章后面没有可安排的回复点。可手动安排，为下一次挑战准备。';state.segments.auto=false;store.set('segments',state.segments);refreshUi();return}state.segments.auto=auto.checked;state.segments.manualUntil=null;state.segments.pending=null;store.set('segments',state.segments);state.segmentNotice=auto.checked?'已开启：会在路上提前安排下一回复点后的队伍，并在回复后核对。':'自动已关闭，保留当前安排。';refreshUi();if(auto.checked)switchSegment()};
       el.querySelectorAll('[data-moves]').forEach(button=>button.onclick=()=>showMovesPanel(button.dataset.moves));
       el.querySelectorAll('[data-api]').forEach(button=>button.onclick=()=>compareWithPokeApi(button.dataset.api,el.querySelector(`[data-info="${button.dataset.api}"]`)));
     },{before:'.pc-sticky'});
   }
 
 
-  /** The legendary team picker: boss info, odds, the team it computed. */
+  let legendJob = null;
+  let legendResult = null;
+  let legendNotice = null;
+
+  const legendKey = ({ zone, tier }) => [zone.region, zone.id, tier].join(':');
+  const legendLevel = (zone, tier, data) => tier ? data.cfg.MAX_LEVEL : (zone.level ?? data.cfg.MAX_LEVEL);
+
+  function sameLegendPicker(head, key) {
+    if (!eventPickerOpen(head) || document.querySelector('#evt-pick-head') !== head || raidContext()) return false;
+    const ctx = pickerContext();
+    return !!ctx && legendKey(ctx) === key;
+  }
+
+  function legendInfo(ctx, result) {
+    const { engine, data } = state;
+    const { zone, tier } = ctx;
+    const boss = result?.boss || legendBoss(zone, tier, [], engine, data);
+    if (!boss) return '';
+    return `${esc(displayName(zone.id))} · ${boss.types.map(zhType).join('/')} · ${boss.hp.toLocaleString('zh-CN')} 生命值`
+      + (zone.burst ? ` · ${esc(displayMove(zone.burst))}` : '') + (tier ? ` · 精英 ${tier}` : '');
+  }
+
+  function renderLegendTeam(result) {
+    if (!result) return '';
+    const statusNames = { burn: '灼伤', poison: '中毒', paralysis: '麻痹' };
+    return result.team.map(({ mon, proj, species }, i) => {
+      const level = proj.level < mon.level ? `实际等级 ${mon.level} · 本场按 ${proj.level} 级` : `等级 ${mon.level}`;
+      const profile = result.profiles[i];
+      const dmg = Math.round(profile.damage * (profile.move?.acc ?? 0) / 100);
+      const rounds = profile.incoming > 0 ? Math.max(1, Math.ceil(profile.hp / profile.incoming)) : null;
+      const effects = new Set([profile.setup?.type, profile.secondary?.type].filter(Boolean));
+      return `<div class="pcopt-mon"><div>${i + 1}. <b>${esc(displayName(species.id))}</b> <span class="pcopt-mut">${level}${proj.shiny ? ' ✨' : ''}</span>`
+        + `<div class="pcopt-row">${species.types.map(typeBadge).join('')}</div>`
+        + `<div class="pcopt-mut">约 ${dmg} 伤害/回合${rounds ? ` · 预计能撑 ${rounds} 回合` : ''}${effects.size ? ' · 可施加' + [...effects].map(type => statusNames[type]).join('、') : ''}</div></div></div>`;
+    }).join('');
+  }
+
+  /** The legendary picker computes a recommendation before the player chooses to apply it. */
   function mountLegendBox(head, ctx) {
-    state.legBoss = ctx.zone.id;
-    state.legTier = ctx.tier;
-    state.legRegion = ctx.zone.region;
-    const key = 'legend:' + ctx.zone.id + ':' + ctx.tier;
+    const key = legendKey(ctx);
+    const result = legendResult?.head === head && legendResult.key === key && legendResult.preset === state.preset
+      ? legendResult : null;
+    const job = legendJob?.head === head && legendJob.key === key ? legendJob : null;
+    const notice = legendNotice?.head === head && legendNotice.key === key ? legendNotice.text : '';
+    const status = job?.status || notice || (result ? `已推荐 ${result.team.length} 只，可应用这些位置。` : '点击“助手配队”生成传说对战队伍');
+    const info = legendInfo(ctx, result);
+    const odds = result ? oddsText(result.odds) : '';
+    const rows = renderLegendTeam(result);
+    const sig = JSON.stringify([key, state.preset, state.busy, info, status, !!job, odds, rows, state.errors]);
     const html = `
       <div class="pcopt-row" style="margin-top:6px">
         ${presetSeg()}
-        <button class="btn small" data-act="run" ${state.busy ? 'disabled' : ''}>✨ 助手配队</button>
-        <button class="btn small ghost" data-act="apply" ${state.legTeam && state.legTeam.length && !state.busy ? '' : 'disabled'}>应用队伍</button>
+        <button type="button" class="btn small" data-act="run" ${state.busy ? 'disabled' : ''}>${job ? '计算中…' : '✨ 助手配队'}</button>
+        <button type="button" class="btn small ghost" data-act="apply" ${result && !state.busy ? '' : 'disabled'}>应用队伍</button>
+        ${job ? '<button type="button" class="btn small ghost" data-act="cancel-legend">取消计算</button>' : ''}
       </div>
-      <div class="pcopt-mut">${legendInfo()}</div>
-      <div class="pcopt-mut">${legendOddsLine()}</div>
-      <div data-team>${renderLegendTeam()}</div>
+      <div class="pcopt-mut">${info}</div>
+      <div class="pcopt-mut" role="status">${esc(status)}</div>
+      ${odds ? `<div class="pcopt-mut">${odds}</div>` : ''}
+      ${rows ? `<div data-team>${rows}</div>` : ''}
       ${errLine()}`;
-    const sig = JSON.stringify([key, state.preset, state.busy,
-      state.legTeam && state.legTeam.map(t => t.mon.uid).join(','),
-      state.legOdds && [state.legOdds.winChance, state.legOdds.rounds, state.legOdds.pCatch, state.legOdds.attempts],
-      state.errors]);
     mountBlock(head, 'legend', sig, html, el => {
-      el.querySelectorAll('[data-preset]').forEach(b => b.onclick = () => {
-        state.preset = b.dataset.preset;
-        el.querySelectorAll('[data-preset]').forEach(x => x.classList.toggle('on', x.dataset.preset === state.preset));
-        refreshUi();
+      el.querySelectorAll('[data-preset]').forEach(button => {
+        button.disabled = !!job;
+        button.onclick = () => {
+          if (state.busy || state.preset === button.dataset.preset) return;
+          state.preset = button.dataset.preset;
+          legendNotice = null;
+          legendResult = null;
+          refreshUi();
+        };
       });
-      el.querySelector('[data-act="run"]').onclick = () => runLegendOptimizer();
-      el.querySelector('[data-act="apply"]').onclick = () => applyTeamFromPanel(state.legTeam, true);
+      el.querySelector('[data-act="run"]').onclick = () => runLegendOptimizer(head, ctx);
+      el.querySelector('[data-act="apply"]').onclick = async () => {
+        if (!result || result.preset !== state.preset || !sameLegendPicker(head, key) || state.busy) return;
+        const available = new Map(eventCandidates(readSave(), legendLevel(ctx.zone, ctx.tier, state.data), ctx.zone.region)
+          .map(candidate => [candidate.mon.uid, candidate.mon]));
+        if (result.team.some(({ mon }) => {
+          const current = available.get(mon.uid);
+          return !current || memberSignature(current) !== memberSignature(mon) || current.level !== mon.level;
+        })) {
+          legendResult = null;
+          legendNotice = { head, key, text: '推荐成员已变化，请重新配队。' };
+          refreshUi();
+          return;
+        }
+        legendNotice = { head, key, text: '正在应用队伍…' };
+        await applyTeamFromPanel(result.team, true);
+        legendNotice = { head, key, text: state.errors.length ? '队伍应用未完成。' : `已应用并核对 ${result.team.length} 个位置。` };
+        refreshUi();
+      };
+      const cancel = el.querySelector('[data-act="cancel-legend"]');
+      if (cancel) cancel.onclick = () => { job.cancelled = true; };
     });
   }
+
+  async function runLegendOptimizer(head = document.querySelector('#evt-pick-head'), ctx = pickerContext()) {
+    if (!head || !ctx || state.busy) return;
+    const { zone, tier } = ctx;
+    const key = legendKey(ctx);
+    const preset = state.preset;
+    const job = { head, key, cancelled: false, status: '正在读取可用宝可梦…' };
+    const active = () => !job.cancelled && sameLegendPicker(head, key);
+    state.busy = true;
+    state.errors = [];
+    legendResult = null;
+    legendNotice = null;
+    legendJob = job;
+    refreshUi();
+
+    // Yield to the page between short batches so clicks, scrolling, and closing still work.
+    const runSteps = async steps => {
+      while (active()) {
+        const deadline = performance.now() + 12;
+        do {
+          const step = steps.next();
+          if (step.done) return step.value;
+        } while (performance.now() < deadline);
+        await sleep(0);
+      }
+      return null;
+    };
+
+    try {
+      await sleep(20);
+      if (!active()) return;
+      if (!await ensureData()) throw new Error('游戏数据尚未就绪，请重试。');
+      if (!active()) return;
+      const save = readSave();
+      if (!save) throw new Error('未读取到冒险存档。');
+      const { data, engine } = state;
+      const candidates = eventCandidates(save, legendLevel(zone, tier, data), zone.region);
+      job.status = '正在比较候选阵容…';
+      refreshUi();
+      const team = await runSteps(searchLegendSteps(candidates, zone, tier, engine, data, preset));
+      if (!active()) return;
+      if (!team?.length) throw new Error('没有符合条件的宝可梦。');
+      job.status = '正在模拟胜率…';
+      refreshUi();
+      const odds = await runSteps(legendOddsSteps(zone, tier, team, engine, data, save));
+      if (!active()) return;
+      const boss = legendBoss(zone, tier, team, engine, data);
+      legendResult = { head, key, preset, team, odds, boss, profiles: legendTurnStats(team, boss, engine) };
+    } catch (error) {
+      logError('legend optimizer: failed', error);
+      if (active()) legendNotice = { head, key, text: '配队失败：' + zhError(error?.message || error) };
+    } finally {
+      if (job.cancelled && sameLegendPicker(head, key)) {
+        legendNotice = { head, key, text: '已取消配队，可重新计算。' };
+      }
+      legendJob = null;
+      state.busy = false;
+      refreshUi();
+    }
+  }
+
 
   /** The raid picker: fastest clear and the total DPS line. */
   function mountRaidBox(head,rc){
     const saved=state.evtOdds?.key==='raid:'+rc.id?state.evtOdds.text:'';
-    const html=`<div class="pcopt-row"><button class="btn small" data-act="run" ${state.busy?'disabled':''}>推荐己方两只</button></div><div class="pcopt-mut">这里只选择你的宝可梦。同伴请关闭此窗口，回团体战主页面选择。</div><div class="pcopt-mut" role="status">${esc(saved)}</div>${errLine()}`;
+    const html=`<div class="pcopt-row"><button class="btn small" data-act="run" ${state.busy?'disabled':''}${state.busy?"正在比较或填入…":"推荐并填入己方两只"}</button></div><div class="pcopt-mut">这里只选择你的宝可梦。同伴请关闭此窗口，回团体战主页面选择。</div><div class="pcopt-mut" role="status">${esc(saved)}</div>${errLine()}`;
     mountBlock(head,'raid',JSON.stringify([rc.id,state.busy,saved,state.errors]),html,el=>{
       el.querySelector('[data-act="run"]').onclick=async()=>{
         if(state.busy)return;state.busy=true;state.errors=[];refreshUi();
@@ -3631,6 +4308,7 @@
     try {
       cleanupLegacy();
       mountMonitor();
+      mountRoamerHunt(document.querySelector('#screen-adventure .adv-main'), true);
       mountTemplates();
       mountChapter();
       mountRaidAllyButtons();
@@ -3667,7 +4345,7 @@
     state.dataError = '';
     // Start in a microtask so a cached load cannot finish before state.loading is assigned.
     state.loading = Promise.resolve().then(async () => {
-      const cacheKey = 'bundle:zh162v1:' + url;
+      const cacheKey = 'bundle:zh1110:' + url;
       let data = options.force ? null : await store.getAsync(cacheKey, null);
       if (!dataLooksValid(data) || !data.chart || Object.keys(data.chart).length < 18) data = null;
       if (!data) {
@@ -3833,7 +4511,7 @@
 
   function routeSignature(save){
     return JSON.stringify([save?.adv?.chapter,save?.adv?.event,save?.adv?.zone,save?.adv?.tower,save?.adv?.league,
-      save?.link?.side,save?.link?.to,save?.autoSwitch!==false,(save?.adv?.nodes||[]).map(n=>({type:n.type,name:n.name,team:n.team,gym:n.gym,id:n.id,level:n.level,lv:n.lv,areas:n.areas,species:n.species,pool:n.pool,size:n.size,classes:n.classes,statMult:n.statMult,rank:n.rank,gymTrainer:n.gymTrainer}))]);
+      save?.link?.side,save?.link?.to,save?.autoSwitch!==false,(save?.adv?.nodes||[]).map(n=>({type:n.type,name:n.name,team:n.team,gym:n.gym,id:n.id,level:n.level,lv:n.lv,areas:n.areas,species:n.species,pool:n.pool,size:n.size,classes:n.classes,statMult:n.statMult,rank:n.rank,gymTrainer:n.gymTrainer,roamer:chapterRoamer(n,save)}))]);
   }
   function memberSignature(mon){return JSON.stringify([mon.id,mon.rank||0,!!mon.shiny,mon.reg||'kanto',mon.taste,mon.statMult||1,mon.hpMult||1]);}
   function memberBasis(save,uids){return uids.map(uid=>{const mon=monByUid(save,uid);return{uid,signature:mon&&memberSignature(mon),level:mon?.level};});}
@@ -3868,9 +4546,9 @@
     return JSON.stringify([save?.adv?.chapter,save?.adv?.node,!!save?.adv?.battle,seedHash(JSON.stringify(save?.adv?.nodes||[])),save?.link?.side,save?.link?.to,save?.team,
       (save?.mons||[]).map(m=>[m.uid,m.id,m.level,m.xp,m.rank,m.shiny,m.hp,m.status,m.sleep,m.bit,m.confused]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))]);
   }
-  function currentCandidates(save,fullHeal=false,eventCap=null){
+  function currentCandidates(save,fullHeal=false,eventCap=null,allow=mon=>canJoinTeam(save,mon)){
     const away=awayUids(save);
-    return(save.mons||[]).filter(m=>!away.has(m.uid)&&state.data.species[m.id]&&canJoinTeam(save,m)).map(original=>{
+    return(save.mons||[]).filter(m=>!away.has(m.uid)&&state.data.species[m.id]&&allow(m)).map(original=>{
       const mon={...original};if(fullHeal){delete mon.status;delete mon.bit;delete mon.sleep;delete mon.sleepLeft;delete mon.confused;}
       const level=eventCap==null?mon.level:Math.min(mon.level,eventCap),sp=state.data.species[mon.id];
       const proj={...mon,level,types:sp.types},hp=state.engine.maxHp(proj),hpCur=fullHeal?hp:mon.hp==null?hp:clamp(mon.hp,0,hp);
@@ -3883,7 +4561,7 @@
     for(const step of plan){if(step.kind!=='battle')continue;
       const spec=withSimSeed(seedHash('rank:'+step.nodeIndex),()=>rollBattleFoes(step,state.data,save,state.events?.cap??100));
       if(!spec)throw new Error('无法读取战斗对手，未计算推荐。');
-      for(const foe of spec.foes)foes.push({...foe,weight:step.type==='gym'?2:1});
+      for(const foe of spec.foes)foes.push({...foe,weight:step.roamer?3:step.type==='gym'?2:1});
     }
     return candidates.map(candidate=>{
       const hp=fullHeal?candidate.hp:candidate.hpCur;let dmg=0,survive=0,weight=0,bestDmg=-1,bestMoveKey='',special=[];
@@ -3973,7 +4651,7 @@
       if(out.error)throw new Error(out.error);
       state.team=out.team;state.resultFingerprint=fingerprint;state.resultPlannedTeamBasis=(save.team||[]).slice();state.resultLevels=Object.fromEntries(save.mons.map(m=>[m.uid,m.level]));state.resultContext={route:routeSignature(save),scope:state.planScope,heal:nextHealNode(save),members:memberBasis(save,out.team.map(c=>c.mon.uid)),roster:rosterStamp(save)};state.resultStale=recommendationStale(readSave());
       const chosen=new Set(out.team.map(c=>c.mon.uid)),old=new Set(save.team||[]),changes={added:out.team.filter(c=>!old.has(c.mon.uid)).map(c=>displayName(c.mon.id)),removed:(save.team||[]).filter(uid=>!chosen.has(uid)).map(uid=>displayName(monByUid(save,uid)?.id))};
-      state.sim={...out.res,changes,baseline:out.baseline,reason:out.reason,focus:out.focus,range:out.range,scope:state.planScope,poolSize:out.poolSize,totalCandidates:out.totalCandidates,evaluated:out.evaluated,ms:Date.now()-started};
+      state.sim={...out.res,changes,baseline:out.baseline,reason:out.reason,focus:out.focus,range:out.range,scope:state.planScope,poolSize:out.poolSize,totalCandidates:out.totalCandidates,roamers:out.plan.filter(step=>step.roamer).map(step=>step.roamer),evaluated:out.evaluated,ms:Date.now()-started};
       if(state.resultStale)state.errors=[recommendationIssue(readSave())];
     }catch(error){state.errors=[error.message]}finally{state.busy=false;state.progress=null;refreshUi()}
   }
@@ -4004,35 +4682,7 @@
     }
   }
 
-  async function runLegendOptimizer() {
-    state.busy = true; state.errors = []; refreshUi();
-    log('info', 'legend optimizer: start', { region: state.legRegion, boss: state.legBoss, tier: state.legTier });
-    try {
-      await ensureData();
-      const zone = legendZone();
-      if (!zone) { state.errors = ['no boss zone']; state.busy = false; refreshUi(); return; }
-      const save = readSave();
-      if (!save) { state.errors = ['no save found']; state.busy = false; refreshUi(); return; }
-      // the game brings the team to the zone's level (max level for an elite tier) and heals it
-      const zoneLevel = state.legTier ? state.data.cfg.MAX_LEVEL : (zone.level ?? state.data.cfg.MAX_LEVEL);
-      const cands = currentCandidates(save, true, zoneLevel);
-      state.legTeam = pickLegendTeam(cands, zone, state.legTier, state.engine, state.data);
-      state.legOdds = state.legTeam.length
-        ? legendOdds(zone, state.legTier, state.legTeam, state.engine, state.data, save)
-        : null;
-      if (!state.legTeam.length) state.errors = ['no candidate found in the PC'];
-      log('info', 'legend optimizer: done', {
-        boss: displayName(zone.id), tier: state.legTier, level: zoneLevel,
-        team: state.legTeam.map(t => displayName(t.species.id)),
-        odds: state.legOdds && { win: state.legOdds.winChance, rounds: state.legOdds.rounds, catch: state.legOdds.pCatch },
-      });
-    } catch (e) {
-      logError('legend optimizer: failed', e);
-      state.errors = ['legend optimizer error: ' + e.message];
-    }
-    state.busy = false;
-    refreshUi();
-  }
+
 
   async function applyTeamFromPanel(team,picker=false){
     team=team||state.team;if(!team?.length||state.busy)return;
@@ -4090,7 +4740,7 @@
     document.addEventListener('pointerdown',event=>{if(!event.isTrusted||state.busy||!state.segments?.auto||!event.target.closest?.('#team-slots .slot,#team-mini .slot,#pc-grid .pc-cell'))return;state.segments.manualUntil=nextHealNode(readSave());state.segments.pending=null;store.set('segments',state.segments);},true);
     state.watcher = new WipeWatcher(rec => {
       refreshUi();
-      if (rec) {
+      if (rec && !roamerHunt) {
         // the run restarts from the chapter start: drop the manual pick and field segment 1 again
         state.manual = null;
         state.segOn = null;

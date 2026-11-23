@@ -5,7 +5,8 @@
 - 原版基线：**1.6.4**。
 - 基线提交：[f65c0cc7dcd1b1f77dd1a3be3ea55f448912ea26](https://github.com/smuglilgoat/pokecatch-helper/commit/f65c0cc7dcd1b1f77dd1a3be3ea55f448912ea26)。
 - 原版脚本 SHA-256：`94a7b36ad73870c75f8109f3c6c3d91c00a25d75a1779d283b6f49027bb44668`。
-- 核对日期：2026-11-20。中文版 1.9.0 是本分支自己的版本号，不表示原版也发布了 1.9.0。
+- 上述基线核对日期为 2026-11-20。中文版与原版独立编号。
+- 后续参考原版的 [游荡传说追捕与限频](https://github.com/smuglilgoat/pokecatch-helper/commit/0e6720cf1177df3d14f0bada9fe62a1644479837) 和 [首领状态、团体战生存及游荡首领建模](https://github.com/smuglilgoat/pokecatch-helper/commit/7fcae90bc7a4f2d535802bf6cccc0d3fa8cb35a8)。中文版按本次核对的游戏选队规则实现。
 - 原版脚本 `pokecatch-team-optimizer.user.js` 保留在 Fork 中；安装本分支时请选择带 `zh-CN` 的文件。
 - 原版说明另存为 `UPSTREAM_README.md`，内容描述的是原版，当前行为以本仓库 README 与使用指南为准。
 
